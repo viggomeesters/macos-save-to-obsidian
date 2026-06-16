@@ -4,16 +4,13 @@
 #
 # Delegates to _log_brain_event from brain-env.sh.
 
-# Compute LIFE_OS_CORE root — scripts/raycast/ is 2 levels deep
+# Compute local repo root — scripts/raycast/ is 2 levels deep
 _RAYCAST_LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export BRAIN_DIR="${_RAYCAST_LOG_DIR%/scripts/raycast}"
-export BRAIN_SCRIPTS="$BRAIN_DIR/scripts"
-
-# Cross-repo paths
-export LIFE_OS_CORE="$BRAIN_DIR"
-export LIFE_OS_MEETING="$HOME/Dev/life-os-meeting"
-export LIFE_OS_CONSUMPTION="$HOME/Dev/life-os-consumption"
-export LIFE_OS_SHARED="$BRAIN_DIR/shared"
+export MACOS_MAIL_REPO="${_RAYCAST_LOG_DIR%/scripts/raycast}"
+export BRAIN_DIR="$MACOS_MAIL_REPO"
+export BRAIN_SCRIPTS="$MACOS_MAIL_REPO/scripts"
+export BRAIN_SHARED="$MACOS_MAIL_REPO/shared"
+export LIFE_OS_SHARED="$BRAIN_SHARED"
 export RAYCAST_COMMAND_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[1]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[1]:-$0}")"
 export RAYCAST_COMMAND_LOG="${BRAIN_STATE_DIR:-$BRAIN_DIR/state}/raycast/commands.jsonl"
 
