@@ -1,0 +1,1895 @@
+#!/usr/bin/env python3
+"""Save the currently selected Apple Mail or Microsoft Outlook message to the vault.
+
+Designed for speed: AppleScript fetch → SQLite dedup → entity resolve → vault write.
+Called directly or via Raycast Script Command.
+
+Usage:
+    python3 save_mail.py              # Save selected mail; flagged mail creates a task
+    python3 save_mail.py --client outlook
+    python3 save_mail.py --task       # Force follow-up task for selected mail
+    python3 save_mail.py --no-archive # Save without archiving
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import re
+import sys
+from datetime import datetime
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Iterator
+
+import yaml
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "shared"))
+import brain_lib
+
+from entity_resolver import SELF_EMAILS, resolve_entity, suggest_topics
+from mail_project_rules import MailProjectMatch, resolve_mail_project
+import mail_applescript
+from mail_applescript import (
+    archive_mail,
+    classify_mailbox_type,
+    fetch_all_mailboxes,
+    fetch_conversation_candidates,
+    fetch_mail_body,
+    get_selected_mail_header,
+    get_selected_mail_headers,
+    is_mail_running,
+    save_attachments,
+)
+
+# Re-export for backward compatibility (save_message.py imports from here)
+from entity_resolver import SELF_EMAILS as SELF_EMAILS  # noqa: F811
+import vault_note_writer as vnw
+from vault_note_writer import escape_title  # noqa: F401
+
+VAULT_ROOT = brain_lib.cfg.vault_root
+NOTES_DIR = brain_lib.cfg.vault_notes
+INBOX_DIR = brain_lib.cfg.vault_inbox
+MAIL_NOTE_TYPE = "interaction"
+TASK_NOTE_TYPE = "task"
+MAIL_CLIENT_APPLE = "apple"
+MAIL_CLIENT_OUTLOOK = "outlook"
+MAIL_CLIENT_AUTO = "auto"
+MAIL_CLIENTS = (MAIL_CLIENT_APPLE, MAIL_CLIENT_OUTLOOK, MAIL_CLIENT_AUTO)
+
+
+def _load_mail_client(client: str) -> ModuleType:
+    if client == MAIL_CLIENT_APPLE:
+        return mail_applescript
+    if client == MAIL_CLIENT_OUTLOOK:
+        return importlib.import_module("mail_outlook_applescript")
+    raise ValueError(f"Unsupported mail client: {client}")
+
+
+def _is_client_running(adapter: ModuleType) -> bool:
+    if hasattr(adapter, "is_mail_running"):
+        return bool(adapter.is_mail_running())
+    if hasattr(adapter, "is_outlook_running"):
+        return bool(adapter.is_outlook_running())
+    return True
+
+
+def _selected_headers_for_client(client: str) -> list[dict[str, Any]]:
+    adapter = _load_mail_client(client)
+    return adapter.get_selected_mail_headers()
+
+
+def get_selected_headers_for_client(client: str) -> tuple[str, list[dict[str, Any]]]:
+    """Return selected mail headers for a concrete or auto-detected client."""
+    if client != MAIL_CLIENT_AUTO:
+        if client == MAIL_CLIENT_APPLE:
+            return client, get_selected_mail_headers()
+        return client, _selected_headers_for_client(client)
+
+    errors: list[str] = []
+    for candidate in (MAIL_CLIENT_OUTLOOK, MAIL_CLIENT_APPLE):
+        adapter = _load_mail_client(candidate)
+        if not _is_client_running(adapter):
+            errors.append(f"{candidate}: app not running")
+            continue
+        try:
+            return candidate, adapter.get_selected_mail_headers()
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+    detail = "; ".join(errors) if errors else "no supported mail clients available"
+    raise RuntimeError(f"No selected mail found in Outlook or Apple Mail ({detail})")
+
+
+@contextmanager
+def use_mail_client(client: str) -> Iterator[ModuleType]:
+    """Temporarily route adapter calls used by the save flow."""
+    adapter = _load_mail_client(client)
+    old_values = (
+        globals()["archive_mail"],
+        globals()["fetch_all_mailboxes"],
+        globals()["fetch_conversation_candidates"],
+        globals()["fetch_mail_body"],
+        globals()["get_selected_mail_headers"],
+        globals()["save_attachments"],
+    )
+    globals()["archive_mail"] = adapter.archive_mail
+    globals()["fetch_all_mailboxes"] = adapter.fetch_all_mailboxes
+    globals()["fetch_mail_body"] = adapter.fetch_mail_body
+    globals()["get_selected_mail_headers"] = adapter.get_selected_mail_headers
+    globals()["save_attachments"] = adapter.save_attachments
+    if hasattr(adapter, "fetch_conversation_candidates"):
+        globals()["fetch_conversation_candidates"] = adapter.fetch_conversation_candidates
+    else:
+        globals()["fetch_conversation_candidates"] = lambda *args, **kwargs: []
+    try:
+        yield adapter
+    finally:
+        (
+            globals()["archive_mail"],
+            globals()["fetch_all_mailboxes"],
+            globals()["fetch_conversation_candidates"],
+            globals()["fetch_mail_body"],
+            globals()["get_selected_mail_headers"],
+            globals()["save_attachments"],
+        ) = old_values
+
+
+def mail_client_context(client: str):
+    if client == MAIL_CLIENT_APPLE:
+        return nullcontext()
+    return use_mail_client(client)
+
+# ── Date Parsing ─────────────────────────────────────────────────────────────
+
+
+def parse_apple_date(date_str: str) -> datetime:
+    """Parse AppleScript date formats."""
+    cleaned = re.sub(r"^\w+,\s*", "", date_str.strip())
+    cleaned = cleaned.replace(" at ", " ").replace(" om ", " ")
+    for fmt in (
+        "%d %B %Y %H:%M:%S",
+        "%d %b %Y %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+    return datetime.now()
+
+
+# ── Area & Project Detection ─────────────────────────────────────────────────
+
+
+def detect_area(sender_email: str, to_emails: str) -> str:
+    all_emails = f"{sender_email} {to_emails}"
+    if "mccoy" in all_emails or "groningen.nl" in all_emails or "uu.nl" in all_emails:
+        return "work"
+    return "self"
+
+
+def detect_project(sender_email: str, to_emails: str) -> str | None:
+    match = detect_mail_project(
+        {"sender_email": sender_email, "sender_display": sender_email, "to": to_emails}
+    )
+    if match and not match.is_ambiguous:
+        return match.project
+    return None
+
+
+def detect_mail_project(mail: dict[str, Any]) -> MailProjectMatch | None:
+    """Best-effort project detection for mail metadata."""
+    try:
+        return resolve_mail_project(mail)
+    except Exception:
+        return None
+
+
+# ── Deduplication ────────────────────────────────────────────────────────────
+
+_DEDUP_CACHE = brain_lib.ROOT / "context" / "observability" / "save-mail-dedup.json"
+
+
+def _dedup_cache_check(message_id: str) -> str | None:
+    """Check local dedup cache (survives when SQLite indexer is down)."""
+    try:
+        if _DEDUP_CACHE.exists():
+            cache = json.loads(_DEDUP_CACHE.read_text())
+            return cache.get(message_id)
+    except Exception:
+        pass
+    return None
+
+
+def _dedup_cache_add(message_id: str, slug: str) -> None:
+    """Add entry to local dedup cache."""
+    message_id = clean_message_id(message_id)
+    if not message_id:
+        return
+    try:
+        cache = {}
+        if _DEDUP_CACHE.exists():
+            cache = json.loads(_DEDUP_CACHE.read_text())
+        cache[message_id] = slug
+        _DEDUP_CACHE.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+
+def is_duplicate(message_id: str) -> str | None:
+    """Check if a mail with this message_id already exists. Returns slug or None."""
+    message_id = clean_message_id(message_id)
+    if not message_id:
+        return None
+
+    cached = _dedup_cache_check(message_id)
+    if cached:
+        return cached
+
+    try:
+        import sqlite3
+
+        db_path = VAULT_ROOT / ".brain-vault-index.sqlite"
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            mail_link = f"message://<{message_id}>"
+            mail_link_like = (
+                mail_link.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            rows = conn.execute(
+                "SELECT path FROM notes WHERE type = 'interaction' AND category = 'mail' "
+                "AND frontmatter_json LIKE ? ESCAPE '\\' LIMIT 1",
+                (f"%{mail_link_like}%",),
+            ).fetchall()
+            if rows:
+                from pathlib import PurePosixPath
+
+                rows = [(PurePosixPath(rows[0][0]).stem,)]
+        finally:
+            conn.close()
+        return rows[0][0] if rows else None
+    except Exception:
+        return None
+
+
+def find_thread_notes(entity_slug: str, subject: str) -> list[str]:
+    """Find existing mail notes in the same thread (same entity + cleaned subject)."""
+    cleaned = re.sub(
+        r"^((Re|Fwd|FW|AW|Antw|SV):\s*)+", "", subject, flags=re.IGNORECASE
+    ).strip()
+    if not cleaned or len(cleaned) < 3:
+        return []
+    try:
+        import sqlite3
+
+        db_path = VAULT_ROOT / ".brain-vault-index.sqlite"
+        if not db_path.exists():
+            return []
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            escaped = (
+                cleaned.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            entity_json = f'["{entity_slug}"]'
+            rows = conn.execute(
+                "SELECT slug FROM notes WHERE type = 'interaction' AND category = 'mail' "
+                "AND entity = ? "
+                "AND title LIKE ? ESCAPE '\\' ORDER BY created DESC LIMIT 10",
+                (entity_json, f"%{escaped}%"),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
+# ── Conversation Detection ──────────────────────────────────────────────────
+
+REPLY_PREFIX_RE = re.compile(
+    r"^((Re|Fwd|FW|AW|Antw|SV):\s*)+", flags=re.IGNORECASE
+)
+CONVERSATION_REPLY_PREFIX_RE = re.compile(
+    r"^((Re|AW|Antw|SV):\s*)+", flags=re.IGNORECASE
+)
+MESSAGE_ID_RE = re.compile(r"<([^<>\s]+)>")
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+GENERIC_SUBJECTS = {
+    "hi",
+    "hoi",
+    "hello",
+    "vraag",
+    "question",
+    "meeting",
+    "update",
+    "invoice",
+    "factuur",
+}
+_SELF_EMAIL_SET = {email.lower() for email in SELF_EMAILS}
+
+
+def strip_reply_prefixes(subject: str) -> str:
+    return REPLY_PREFIX_RE.sub("", subject or "").strip()
+
+
+def has_reply_prefix(subject: str) -> bool:
+    return bool(CONVERSATION_REPLY_PREFIX_RE.match(subject or ""))
+
+
+def normalize_subject(subject: str) -> str:
+    cleaned = strip_reply_prefixes(subject)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+    return cleaned
+
+
+def is_generic_subject(subject: str) -> bool:
+    normalized = normalize_subject(subject)
+    return len(normalized) < 5 or normalized in GENERIC_SUBJECTS
+
+
+def parse_mail_headers(raw_headers: str) -> dict[str, str]:
+    """Parse unfolded RFC-style mail headers into a lowercase dict."""
+    headers: dict[str, str] = {}
+    current_lines: list[str] = []
+    for raw_line in (raw_headers or "").replace("\r\n", "\n").split("\n"):
+        if not raw_line:
+            continue
+        if raw_line[:1] in (" ", "\t") and current_lines:
+            current_lines[-1] = current_lines[-1] + " " + raw_line.strip()
+        else:
+            current_lines.append(raw_line.strip())
+
+    for line in current_lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = key.strip().lower()
+        normalized_value = value.strip()
+        if normalized_key in headers:
+            headers[normalized_key] = headers[normalized_key] + "\n" + normalized_value
+        else:
+            headers[normalized_key] = normalized_value
+    return headers
+
+
+def clean_message_id(value: str) -> str:
+    cleaned = (value or "").strip().strip("<>").strip()
+    if cleaned.startswith("message://"):
+        cleaned = cleaned.removeprefix("message://").strip("<>")
+    return cleaned
+
+
+def _has_reply_context(mail: dict[str, Any]) -> bool:
+    headers = parse_mail_headers(mail.get("all_headers", ""))
+    return has_reply_prefix(mail.get("subject", "")) or bool(headers.get("in-reply-to"))
+
+
+def existing_thread_slug_map(message_ids: list[str]) -> dict[str, str]:
+    """Return already-saved thread slugs keyed by normalized message id."""
+    existing: dict[str, str] = {}
+    for message_id in message_ids:
+        cleaned = clean_message_id(message_id)
+        key = cleaned.lower()
+        if not cleaned or key in existing:
+            continue
+        slug = is_duplicate(cleaned)
+        if slug:
+            existing[key] = slug
+    return existing
+
+
+def extract_message_ids(value: str) -> list[str]:
+    if not value:
+        return []
+    matches = MESSAGE_ID_RE.findall(value)
+    if not matches:
+        matches = [token for token in re.split(r"[\s,]+", value) if "@" in token]
+
+    seen: set[str] = set()
+    ids: list[str] = []
+    for match in matches:
+        cleaned = clean_message_id(match)
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            seen.add(key)
+            ids.append(cleaned)
+    return ids
+
+
+def conversation_message_ids(mail: dict[str, Any]) -> list[str]:
+    headers = parse_mail_headers(mail.get("all_headers", ""))
+    values = [
+        mail.get("message_id", ""),
+        headers.get("message-id", ""),
+        headers.get("in-reply-to", ""),
+        headers.get("references", ""),
+    ]
+
+    seen: set[str] = set()
+    ids: list[str] = []
+    for value in values:
+        candidates = extract_message_ids(value)
+        if not candidates and value:
+            candidates = [clean_message_id(value)]
+        for message_id in candidates:
+            key = message_id.lower()
+            if message_id and key not in seen:
+                seen.add(key)
+                ids.append(message_id)
+    return ids
+
+
+def _thread_index_root(value: str) -> str:
+    compact = re.sub(r"\s+", "", value or "")
+    if not compact:
+        return ""
+    return compact[:44] if len(compact) >= 44 else compact
+
+
+def _is_self_email(email: str) -> bool:
+    normalized = email.lower()
+    if normalized in _SELF_EMAIL_SET:
+        return True
+    for pattern in _SELF_EMAIL_SET:
+        if "*" not in pattern:
+            continue
+        regex = "^" + re.escape(pattern).replace("\\*", ".*") + "$"
+        if re.match(regex, normalized):
+            return True
+    return False
+
+
+def mail_participants(mail: dict[str, Any]) -> set[str]:
+    headers = parse_mail_headers(mail.get("all_headers", ""))
+    fields = [
+        mail.get("sender_email", ""),
+        mail.get("sender_display", ""),
+        mail.get("to", ""),
+        mail.get("cc", ""),
+        headers.get("from", ""),
+        headers.get("to", ""),
+        headers.get("cc", ""),
+        headers.get("reply-to", ""),
+    ]
+    return {email.lower() for email in EMAIL_RE.findall(" ".join(fields))}
+
+
+def _external_participants(mail: dict[str, Any]) -> set[str]:
+    return {email for email in mail_participants(mail) if not _is_self_email(email)}
+
+
+def _participants_overlap(selected: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    selected_external = _external_participants(selected)
+    candidate_external = _external_participants(candidate)
+    if selected_external and candidate_external:
+        return bool(selected_external & candidate_external)
+    return False
+
+
+def _conversation_signature(mail: dict[str, Any]) -> dict[str, Any]:
+    headers = parse_mail_headers(mail.get("all_headers", ""))
+    subject = mail.get("subject", "")
+    thread_topic = headers.get("thread-topic", "")
+    return {
+        "primary_id": clean_message_id(mail.get("message_id", "")).lower(),
+        "message_ids": {mid.lower() for mid in conversation_message_ids(mail)},
+        "thread_index_root": _thread_index_root(headers.get("thread-index", "")),
+        "thread_topic": normalize_subject(thread_topic) if thread_topic else "",
+        "subject": normalize_subject(subject),
+        "has_reply_prefix": has_reply_prefix(subject),
+    }
+
+
+def _conversation_match_reason(
+    selected_mail: dict[str, Any],
+    candidate_mail: dict[str, Any],
+    *,
+    force_subject: bool = False,
+) -> str | None:
+    selected = _conversation_signature(selected_mail)
+    candidate = _conversation_signature(candidate_mail)
+    if candidate["primary_id"] and candidate["primary_id"] == selected["primary_id"]:
+        return "selected"
+    if selected["message_ids"] and candidate["message_ids"]:
+        if selected["message_ids"] & candidate["message_ids"]:
+            return "message-id"
+    if (
+        selected["thread_index_root"]
+        and candidate["thread_index_root"]
+        and selected["thread_index_root"] == candidate["thread_index_root"]
+    ):
+        return "thread-index"
+    if (
+        selected["thread_topic"]
+        and candidate["thread_topic"]
+        and selected["thread_topic"] == candidate["thread_topic"]
+        and _participants_overlap(selected_mail, candidate_mail)
+    ):
+        return "thread-topic"
+    subject_matches = (
+        selected["subject"]
+        and candidate["subject"]
+        and selected["subject"] == candidate["subject"]
+        and not is_generic_subject(selected["subject"])
+        and _participants_overlap(selected_mail, candidate_mail)
+    )
+    if subject_matches and (
+        force_subject or selected["has_reply_prefix"] or candidate["has_reply_prefix"]
+    ):
+        return "reply-subject"
+    return None
+
+
+def conversation_fetch_hints(
+    selected_mail: dict[str, Any], *, force_subject: bool = False
+) -> dict[str, Any]:
+    headers = parse_mail_headers(selected_mail.get("all_headers", ""))
+    thread_topic = headers.get("thread-topic", "")
+    subject_hint = thread_topic or strip_reply_prefixes(selected_mail.get("subject", ""))
+    include_subject = bool(force_subject or _has_reply_context(selected_mail))
+    if is_generic_subject(subject_hint):
+        include_subject = force_subject
+    return {
+        "message_ids": list(conversation_message_ids(selected_mail)),
+        "subject_hint": strip_reply_prefixes(subject_hint),
+        "include_subject": include_subject,
+    }
+
+
+def conversation_lookup_ids(
+    selected_mail: dict[str, Any], *, force: bool = False
+) -> list[str]:
+    """Return message ids worth looking up outside the selected mail itself."""
+    if not force and not _has_reply_context(selected_mail):
+        return []
+
+    selected_id = clean_message_id(selected_mail.get("message_id", "")).lower()
+    ids: list[str] = []
+    seen: set[str] = set()
+    for message_id in conversation_message_ids(selected_mail):
+        cleaned = clean_message_id(message_id)
+        key = cleaned.lower()
+        if not cleaned or key == selected_id or key in seen:
+            continue
+        seen.add(key)
+        ids.append(cleaned)
+    return ids
+
+
+def select_conversation_mails(
+    selected_mail: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    by_id: dict[str, dict[str, Any]] = {}
+    selected_id = clean_message_id(selected_mail.get("message_id", "")).lower()
+    if selected_id:
+        by_id[selected_id] = selected_mail
+    for candidate in candidates:
+        candidate_id = clean_message_id(candidate.get("message_id", "")).lower()
+        if candidate_id and candidate_id not in by_id:
+            by_id[candidate_id] = candidate
+
+    matches: list[dict[str, Any]] = []
+    reasons: set[str] = set()
+    for candidate in by_id.values():
+        reason = _conversation_match_reason(
+            selected_mail, candidate, force_subject=force
+        )
+        if reason:
+            matches.append(candidate)
+            if reason != "selected":
+                reasons.add(reason)
+
+    if len(matches) < 2 or (not force and not reasons):
+        return {
+            "is_conversation": False,
+            "reason": "single",
+            "mails": [selected_mail],
+            "reasons": [],
+        }
+
+    return {
+        "is_conversation": True,
+        "reason": ", ".join(sorted(reasons)) or "forced",
+        "mails": sorted(matches, key=lambda mail: parse_apple_date(mail["date_str"])),
+        "reasons": sorted(reasons),
+    }
+
+
+# ── Note Creation ────────────────────────────────────────────────────────────
+
+
+def _subject_words(subject: str, max_words: int = 3) -> str:
+    """Extract first N meaningful words from subject for slug context."""
+    cleaned = strip_reply_prefixes(subject)
+    cleaned = re.sub(r"\[.*?\]", "", cleaned).strip()
+    words = re.findall(r"[a-z0-9]+", cleaned.lower())
+    words = [w for w in words if len(w) >= 2]
+    return "-".join(words[:max_words])
+
+
+def make_slug(dt: datetime, entity_slug: str, subject: str) -> tuple[str, str]:
+    """Create unique slug: YYYYMMDD-HHMM-mail-entity-word1-word2-word3."""
+    ts = dt.strftime("%Y%m%d-%H%M")
+    ctx = _subject_words(subject)
+    if ctx:
+        base = f"{ts}-mail-{entity_slug}-{ctx}"
+    else:
+        base = f"{ts}-mail-{entity_slug}"
+
+    note_dir = brain_lib.canonical_note_dir(MAIL_NOTE_TYPE, ts, create=True)
+
+    filepath = note_dir / f"{base}.md"
+    if not filepath.exists():
+        return base, ts
+    counter = 2
+    while (note_dir / f"{base}-{counter}.md").exists():
+        counter += 1
+    return f"{base}-{counter}", ts
+
+
+def infer_mail_direction(mail: dict[str, Any]) -> str:
+    """Return the same sent/received label basis used by create_mail_note."""
+    try:
+        _, direction = resolve_entity(mail.get("sender_email", ""), mail.get("to", ""))
+        return direction
+    except Exception:
+        return "sent" if _is_self_email(mail.get("sender_email", "")) else "received"
+
+
+def thread_timeline_label(direction: str) -> str:
+    if direction == "sent":
+        return "Sent"
+    if direction == "received":
+        return "Received"
+    return "Mail"
+
+
+def _sort_thread_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(entries, key=lambda entry: str(entry.get("slug", ""))[:13])
+
+
+def render_thread_timeline(
+    entries: list[dict[str, Any]], current_slug: str | None = None
+) -> list[str]:
+    """Render a complete thread timeline block."""
+    unique_entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in _sort_thread_entries(entries):
+        slug = str(entry.get("slug", "")).strip()
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        unique_entries.append(entry)
+
+    if len(unique_entries) < 2:
+        return []
+
+    lines = ["🔗 Thread:"]
+    for entry in unique_entries:
+        slug = str(entry["slug"])
+        label = thread_timeline_label(str(entry.get("direction", "")))
+        suffix = " (current)" if current_slug and slug == current_slug else ""
+        lines.append(f"- {label} [[{slug}]]{suffix}")
+    return lines
+
+
+def find_note_path_by_slug(slug: str) -> Path | None:
+    inbox_path = INBOX_DIR / f"{slug}.md"
+    if inbox_path.exists():
+        return inbox_path
+    for candidate in NOTES_DIR.rglob(f"{slug}.md"):
+        return candidate
+
+    try:
+        import sqlite3
+
+        db_path = VAULT_ROOT / ".brain-vault-index.sqlite"
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            row = conn.execute(
+                "SELECT path FROM notes WHERE slug = ? LIMIT 1",
+                (slug,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        candidate = Path(row[0])
+        if not candidate.is_absolute():
+            candidate = VAULT_ROOT / candidate
+        return candidate if candidate.exists() else None
+    except Exception:
+        return None
+
+
+def _split_note_content(content: str) -> tuple[dict[str, Any], str]:
+    match = re.match(r"^---\n(.*?)\n---\n?(.*)$", content, flags=re.DOTALL)
+    if not match:
+        return {}, content
+    raw_fm, body = match.groups()
+    frontmatter = yaml.safe_load(raw_fm) or {}
+    if not isinstance(frontmatter, dict):
+        frontmatter = {}
+    return frontmatter, body
+
+
+def _thread_entry_from_slug(slug: str) -> dict[str, Any]:
+    path = find_note_path_by_slug(slug)
+    direction = ""
+    if path and path.exists():
+        try:
+            fm, _ = _split_note_content(path.read_text(encoding="utf-8"))
+            direction = str(fm.get("direction", ""))
+        except Exception:
+            direction = ""
+    return {"slug": slug, "direction": direction, "path": str(path) if path else ""}
+
+
+def replace_thread_timeline_block(
+    body: str,
+    entries: list[dict[str, Any]],
+    *,
+    current_slug: str,
+) -> str:
+    """Replace legacy or generated thread blocks without touching the mail body."""
+    timeline_lines = render_thread_timeline(entries, current_slug)
+    lines = body.split("\n")
+
+    stripped: list[str] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("🔗 Thread:"):
+            i += 1
+            while i < len(lines) and lines[i].startswith("- "):
+                i += 1
+            continue
+        stripped.append(lines[i])
+        i += 1
+
+    if not timeline_lines:
+        return "\n".join(stripped)
+
+    insert_at = None
+    for idx, line in enumerate(stripped):
+        if line.startswith("[📩 Open in Mail]"):
+            insert_at = idx + 1
+            while insert_at < len(stripped) and stripped[insert_at].startswith(
+                "📋 Task:"
+            ):
+                insert_at += 1
+            break
+    if insert_at is None:
+        for idx, line in enumerate(stripped):
+            if line == "---":
+                insert_at = idx
+                break
+    if insert_at is None:
+        insert_at = len(stripped)
+
+    stripped[insert_at:insert_at] = timeline_lines
+    return "\n".join(stripped)
+
+
+def update_note_thread_timeline(
+    path: Path,
+    entries: list[dict[str, Any]],
+    *,
+    current_slug: str,
+) -> bool:
+    """Update one existing mail note with a complete thread timeline."""
+    if not path.exists():
+        return False
+    content = path.read_text(encoding="utf-8")
+    frontmatter, body = _split_note_content(content)
+    if not frontmatter:
+        return False
+
+    slugs = [str(entry.get("slug", "")) for entry in _sort_thread_entries(entries)]
+    thread_slugs = [slug for slug in slugs if slug and slug != current_slug]
+    if thread_slugs:
+        frontmatter["thread"] = thread_slugs
+    else:
+        frontmatter.pop("thread", None)
+
+    body = replace_thread_timeline_block(body, entries, current_slug=current_slug)
+    vnw.write_vault_note(path, frontmatter, body)
+    return True
+
+
+def update_conversation_thread_timeline(entries: list[dict[str, Any]]) -> int:
+    """Update all notes in a conversation with the same complete timeline."""
+    if len(entries) < 2:
+        return 0
+
+    updated = 0
+    for entry in _sort_thread_entries(entries):
+        slug = str(entry.get("slug", ""))
+        if not slug:
+            continue
+        path_value = entry.get("path")
+        path = Path(path_value) if path_value else find_note_path_by_slug(slug)
+        if not path:
+            continue
+        if update_note_thread_timeline(path, entries, current_slug=slug):
+            updated += 1
+    return updated
+
+
+def create_mail_note(
+    mail: dict[str, str],
+    create_task: bool = False,
+    extra_thread_slugs: list[str] | None = None,
+) -> dict:
+    """Create vault interaction note. Returns result dict."""
+    dt = parse_apple_date(mail["date_str"])
+    sender_email = mail["sender_email"]
+    to_emails = mail["to"]
+    subject = mail.get("subject", "Geen onderwerp")
+    message_id = mail["message_id"]
+    mailbox_type = _mailbox_type(mail)
+    mail_client = mail.get("mail_client", "apple")
+    calendar_invite = is_calendar_invite(mail)
+
+    entity_slug, direction = resolve_entity(sender_email, to_emails)
+    project_match = detect_mail_project(mail)
+    area = (
+        project_match.area
+        if project_match and project_match.area
+        else detect_area(sender_email, to_emails)
+    )
+    project = (
+        project_match.project
+        if project_match and not project_match.is_ambiguous
+        else None
+    )
+
+    thread_slugs = find_thread_notes(entity_slug, subject)
+    for thread_slug in extra_thread_slugs or []:
+        if thread_slug not in thread_slugs:
+            thread_slugs.append(thread_slug)
+
+    slug, ts = make_slug(dt, entity_slug, subject)
+    filepath = brain_lib.canonical_note_path(
+        MAIL_NOTE_TYPE, slug, ts, create_parent=True
+    )
+
+    thread_slugs = [s for s in thread_slugs if s != slug]
+
+    created = dt.strftime("%Y-%m-%d")
+    date_display = dt.strftime("%-d %b %Y at %H:%M")
+    emoji = "📤" if direction == "sent" else "📥"
+    escaped_subject = escape_title(subject)
+
+    # Save attachments
+    att_links: list[str] = []
+    att_count = int(mail.get("att_count", "0"))
+    if att_count > 0 and mail_client != MAIL_CLIENT_OUTLOOK:
+        att_links = save_attachments(
+            message_id,
+            ts,
+            account=mail.get("account", ""),
+            mailbox=mail.get("mailbox", ""),
+            filename_prefix=slug,
+        )
+
+    # Build frontmatter
+    topics = suggest_topics(entity_slug, subject)
+    if calendar_invite:
+        topics = sorted({*topics, "calendar"})
+    fm: dict[str, Any] = {
+        "type": "interaction",
+        "category": "mail",
+        "created": created,
+        "slug": slug,
+        "timestamp": ts,
+        "area": area,
+        "direction": direction,
+        "entity": [entity_slug],
+        "from": sender_email,
+        "mail_link": f"message://<{message_id}>",
+        "mail_client": mail_client,
+        "mailbox_type": mailbox_type,
+        "source_account": mail.get("account", ""),
+        "source_mailbox": mail.get("mailbox", ""),
+        "title": escaped_subject,
+        "to": to_emails,
+        "topics": topics,
+    }
+    if calendar_invite:
+        fm["calendar_invite"] = True
+    if project:
+        fm["project"] = project
+        if project_match:
+            fm["project_source"] = project_match.source
+            fm["project_confidence"] = project_match.confidence
+    if mail.get("cc"):
+        fm["cc"] = mail["cc"]
+    if att_links:
+        att_names = []
+        for link in att_links:
+            att_name = link.split("|")[-1].rstrip("]]") if "|" in link else link
+            att_names.append(att_name)
+        fm["attachments"] = att_names
+    if thread_slugs:
+        fm["thread"] = thread_slugs
+
+    # Build body
+    if direction == "sent":
+        from_line = f"📧 From: Me ({sender_email})"
+        to_line = f"📬 To: [[{entity_slug}]] ({to_emails})"
+    else:
+        from_line = f"📧 From: [[{entity_slug}]] ({sender_email})"
+        to_line = f"📬 To: {to_emails}"
+
+    mail_link_label = "Open in Outlook" if mail_client == MAIL_CLIENT_OUTLOOK else "Open in Mail"
+
+    body_lines = [
+        "",
+        f"# {emoji} {subject}",
+        "",
+        from_line,
+        to_line,
+    ]
+    if mail.get("cc"):
+        body_lines.append(f"📋 CC: {mail['cc']}")
+    if calendar_invite:
+        body_lines.append(f"🗓️ Calendar invite ({mailbox_type})")
+    thread_body: list[str] = []
+    if thread_slugs:
+        thread_entries = [_thread_entry_from_slug(thread_slug) for thread_slug in thread_slugs]
+        thread_entries.append({"slug": slug, "direction": direction, "path": str(filepath)})
+        thread_body.extend(render_thread_timeline(thread_entries, slug))
+    body_lines.extend(
+        [
+            f"📅 {date_display}",
+            f"[📩 {mail_link_label}](message://<{message_id}>)",
+            *thread_body,
+            "",
+            "---",
+            "",
+            mail.get("body", ""),
+        ]
+    )
+
+    # Extract links from body
+    links = re.findall(r'https?://[^\s<>")\]]+', mail.get("body", ""))
+    if links:
+        body_lines.extend(["", "## 🔗 Links in Mail", ""])
+        seen = set()
+        for link in links:
+            if link not in seen:
+                body_lines.append(f"- <{link}>")
+                seen.add(link)
+
+    # Attachment section
+    if att_links:
+        body_lines.extend(["", "## 📎 Bijlagen", ""])
+        for link in att_links:
+            if re.search(r"\.(png|jpg|jpeg|gif|webp|svg)\|", link, re.IGNORECASE):
+                body_lines.append(f"!{link}")
+            else:
+                body_lines.append(f"- {link}")
+
+    body = "\n".join(body_lines)
+    vnw.write_vault_note(filepath, fm, body)
+
+    now_ts = datetime.now().strftime("%Y%m%d-%H%M")
+    brain_lib.link_note_in_daily(slug, timestamp=now_ts)
+
+    _dedup_cache_add(message_id, slug)
+
+    result = {
+        "slug": slug,
+        "entity": entity_slug,
+        "direction": direction,
+        "area": area,
+        "project": project,
+        "topics": topics,
+        "thread": thread_slugs,
+        "attachments": len(att_links),
+        "subject": subject,
+        "path": str(filepath),
+        "obsidian_file": brain_lib.obsidian_file_ref(filepath),
+    }
+    if project_match:
+        result["project_source"] = project_match.source
+        result["project_confidence"] = project_match.confidence
+        result["project_match"] = project_match.matched
+        if project_match.candidates:
+            result["project_candidates"] = list(project_match.candidates)
+
+    if create_task:
+        task_result = create_follow_up_task(
+            subject=subject,
+            entity_slug=entity_slug,
+            mail_slug=slug,
+            area=area,
+            project=project,
+        )
+        result["task_slug"] = task_result["slug"]
+        result["task_path"] = task_result["path"]
+        _append_task_link(filepath, task_result["slug"])
+        brain_lib.link_note_in_daily(task_result["slug"])
+
+    return result
+
+
+def create_follow_up_task(
+    subject: str,
+    entity_slug: str,
+    mail_slug: str,
+    area: str,
+    project: str | None,
+) -> dict:
+    """Create a follow-up task note linked to the mail."""
+    now = datetime.now()
+    created = now.strftime("%Y-%m-%d")
+
+    clean_subject = re.sub(
+        r"^(Re:|Fwd:|FW:|AW:|Antw:|SV:)\s*", "", subject, flags=re.IGNORECASE
+    ).strip()
+    task_title = f"Follow-up: {clean_subject}"
+
+    note_dir = brain_lib.canonical_note_dir(TASK_NOTE_TYPE, now, create=True)
+    task_slug, ts = vnw.make_slug(
+        now, TASK_NOTE_TYPE, task_title, notes_dir=note_dir, max_len=50
+    )
+    filepath = brain_lib.canonical_note_path(
+        TASK_NOTE_TYPE, task_slug, ts, create_parent=True
+    )
+
+    fm: dict[str, Any] = {
+        "type": "task",
+        "category": "screen",
+        "created": created,
+        "slug": task_slug,
+        "timestamp": ts,
+        "status": "to-do",
+        "due": created,
+        "area": area,
+        "entity": [entity_slug],
+        "title": escape_title(task_title),
+    }
+    if project:
+        fm["project"] = project
+
+    status_header = brain_lib.format_status_header("\U0001f534 to-do", now)
+    source_quote = brain_lib.format_source_quote("Apple Mail", now)
+    body_lines = [
+        f"# {task_title}",
+        "",
+        f"📧 [[{mail_slug}]]",
+        f"👤 [[{entity_slug}]]",
+        "",
+        status_header,
+        "",
+        "---",
+        source_quote,
+        "",
+    ]
+
+    body = "\n".join(body_lines)
+    vnw.write_vault_note(filepath, fm, body)
+
+    return {
+        "slug": task_slug,
+        "path": str(filepath),
+        "obsidian_file": brain_lib.obsidian_file_ref(filepath),
+    }
+
+
+def _append_task_link(mail_path: Path, task_slug: str) -> None:
+    """Append task reference to the mail note body."""
+    content = mail_path.read_text(encoding="utf-8")
+    marker = "[📩 Open in "
+    if marker in content:
+        lines = content.split("\n")
+        for i, line in enumerate(lines):
+            if marker in line:
+                lines.insert(i + 1, f"📋 Task: [[{task_slug}]]")
+                break
+        content = "\n".join(lines)
+        mail_path.write_text(content, encoding="utf-8")
+
+
+# ── Calendar Invite Detection ───────────────────────────────────────────────
+
+CALENDAR_SUBJECT_PREFIXES = (
+    "Invitation:",
+    "Accepted:",
+    "Declined:",
+    "Tentative:",
+    "Updated:",
+    "Cancelled:",
+    "Canceled:",
+)
+CALENDAR_SENDERS = (
+    "calendar-notification",
+    "calendar.google.com",
+    "calendar@outlook.com",
+    "noreply@calendar.proton.me",
+)
+
+
+def is_calendar_invite(mail: dict) -> bool:
+    """Check if a mail is a calendar invite/response.
+
+    Detects four patterns:
+    1. Standard subject prefixes (Invitation:, Accepted:, etc.)
+    2. Known calendar system senders (calendar.google.com, etc.)
+    3. .ics attachment (Outlook/Exchange direct invites from regular senders)
+    4. has_calendar marker when available
+    """
+    subject = mail.get("subject", "")
+    sender = mail.get("sender_email", "")
+    att_names = mail.get("att_names", "")
+    return (
+        any(subject.startswith(p) for p in CALENDAR_SUBJECT_PREFIXES)
+        or any(s in sender for s in CALENDAR_SENDERS)
+        or ".ics" in att_names.lower()
+        or mail.get("has_calendar") is True
+    )
+
+
+def should_create_follow_up_task(
+    mail: dict[str, Any],
+    *,
+    force_task: bool = False,
+    mailbox_type: str | None = None,
+) -> bool:
+    """Return true when a saved mail should get a follow-up task."""
+    if force_task:
+        return True
+    effective_mailbox = mailbox_type or mail.get("mailbox_type") or "inbox"
+    return bool(mail.get("is_flagged")) and effective_mailbox == "inbox"
+
+
+def _mailbox_type(mail: dict[str, Any]) -> str:
+    mailbox_type = mail.get("mailbox_type")
+    if mailbox_type:
+        return str(mailbox_type)
+    return classify_mailbox_type(mail.get("mailbox", ""), mail.get("account", ""))
+
+
+def _should_archive_after_save(
+    mail: dict[str, Any], *, no_archive: bool, single_mode: bool
+) -> bool:
+    if no_archive:
+        return False
+    if mail.get("mail_client") == MAIL_CLIENT_OUTLOOK:
+        return False
+    if not clean_message_id(mail.get("message_id", "")):
+        return False
+    return _mailbox_type(mail) == "inbox"
+
+
+def process_mail_record(
+    mail: dict[str, Any],
+    *,
+    force_task: bool = False,
+    no_archive: bool = False,
+    single_mode: bool = False,
+    extra_thread_slugs: list[str] | None = None,
+    verbose: bool = True,
+    prefix: str = "",
+) -> dict[str, Any]:
+    """Save one mail record and optionally archive it."""
+    mail["mailbox_type"] = _mailbox_type(mail)
+    subject = mail.get("subject", "?")
+    message_id = mail["message_id"]
+
+    existing = is_duplicate(message_id)
+    _timed("dedup")
+    if existing:
+        now_ts = datetime.now().strftime("%Y%m%d-%H%M")
+        if single_mode:
+            brain_lib.link_note_in_daily(existing, timestamp=now_ts)
+        if verbose:
+            _step(f"{prefix}♻️  al verwerkt → [[{existing}]]")
+        if _should_archive_after_save(
+            mail, no_archive=no_archive, single_mode=single_mode
+        ):
+            try:
+                archive_mail(
+                    message_id,
+                    mail.get("account", ""),
+                    mailbox=mail.get("mailbox", ""),
+                )
+                _timed("archive")
+                if verbose:
+                    _step(f"{prefix}📦 Archive... OK")
+            except Exception:
+                pass
+        result = {
+            "status": "duplicate",
+            "slug": existing,
+            "subject": subject,
+            "direction": infer_mail_direction(mail),
+            "path": str(find_note_path_by_slug(existing) or ""),
+            "mailbox_type": mail["mailbox_type"],
+        }
+        _write_log(result)
+        return result
+
+    if verbose:
+        _step(f"{prefix}🔍 Dedup... nieuw")
+    mail["body"] = fetch_mail_body(
+        message_id,
+        account=mail.get("account", ""),
+        mailbox=mail.get("mailbox", ""),
+    )
+    _timed("body")
+
+    create_task = should_create_follow_up_task(
+        mail,
+        force_task=force_task,
+        mailbox_type=mail["mailbox_type"],
+    )
+    result = create_mail_note(
+        mail,
+        create_task=create_task,
+        extra_thread_slugs=extra_thread_slugs,
+    )
+    _timed("note")
+    if verbose:
+        _step(f"{prefix}📝 → [[{result['slug']}]]")
+        if result.get("task_slug"):
+            _step(f"{prefix}📋 Task → [[{result['task_slug']}]]")
+
+    if _should_archive_after_save(mail, no_archive=no_archive, single_mode=single_mode):
+        archive_result = archive_mail(
+            message_id,
+            mail.get("account", ""),
+            mailbox=mail.get("mailbox", ""),
+        )
+        _timed("archive")
+        result["archived"] = archive_result
+        result["archive_account"] = mail.get("account", "")
+        result["archive_mailbox"] = mail.get("mailbox", "")
+        if archive_result != "OK":
+            result["archive_error"] = archive_result
+            if verbose:
+                _step(f"{prefix}⚠️  Archive overgeslagen: {archive_result}")
+        else:
+            if verbose:
+                _step(f"{prefix}📦 Archive... OK")
+
+    result["status"] = "saved"
+    result["mailbox_type"] = mail["mailbox_type"]
+    _write_log(result)
+    return result
+
+
+def calendar_invite_selected(mail: dict[str, Any]) -> bool:
+    return _mailbox_type(mail) == "deleted" and is_calendar_invite(mail)
+
+
+def process_selected_mail_records(
+    mails: list[dict[str, Any]],
+    *,
+    force_task: bool = False,
+    no_archive: bool = False,
+    force_conversation: bool = False,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Use selected mails as conversation roots without scanning whole accounts."""
+    results: list[dict[str, Any]] = []
+    thread_updated = 0
+    total = len(mails)
+    for index, mail in enumerate(mails, 1):
+        mailbox_type = _mailbox_type(mail)
+        subject = mail.get("subject", "?")[:60]
+        sender = mail.get("sender_email", "?")
+        if verbose:
+            if calendar_invite_selected(mail):
+                marker = "📅"
+            elif mailbox_type == "sent":
+                marker = "📤"
+            else:
+                marker = "📧"
+            _step(f'[{index}/{total}] {marker} "{subject}" van {sender}')
+        outcome = save_mail_with_conversation(
+            mail,
+            force_task=force_task,
+            no_archive=no_archive,
+            force_conversation=force_conversation,
+            allow_subject_fallback=force_conversation,
+            verbose=verbose,
+        )
+        results.extend(outcome["results"])
+        thread_updated += int(outcome.get("thread_updated") or 0)
+    return {
+        "mode": "selection",
+        "reason": "selected-conversation",
+        "results": results,
+        "thread_updated": thread_updated,
+    }
+
+
+def save_mail_with_conversation(
+    selected_mail: dict[str, Any],
+    *,
+    force_task: bool = False,
+    no_archive: bool = False,
+    force_conversation: bool = False,
+    allow_subject_fallback: bool = True,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Save one selected mail, auto-expanding safe conversations."""
+    hints = conversation_fetch_hints(
+        selected_mail, force_subject=force_conversation
+    )
+    lookup_ids = conversation_lookup_ids(
+        selected_mail, force=force_conversation
+    )
+    existing_thread_by_id = existing_thread_slug_map(lookup_ids)
+    existing_thread_slugs = list(dict.fromkeys(existing_thread_by_id.values()))
+    missing_lookup_ids = [
+        message_id
+        for message_id in lookup_ids
+        if clean_message_id(message_id).lower() not in existing_thread_by_id
+    ]
+    should_lookup_conversation = bool(
+        force_conversation
+        or missing_lookup_ids
+        or (hints["include_subject"] and not existing_thread_slugs)
+    )
+    if verbose:
+        _step("🧵 Checking conversation...")
+
+    selection = {
+        "is_conversation": False,
+        "reason": "single",
+        "mails": [selected_mail],
+        "reasons": [],
+    }
+    if should_lookup_conversation:
+        fetch_lookup_ids = lookup_ids if force_conversation else missing_lookup_ids
+        if fetch_lookup_ids:
+            candidates = fetch_conversation_candidates(
+                selected_mail,
+                fetch_lookup_ids,
+                hints["subject_hint"],
+                include_subject=False,
+            )
+            selection = select_conversation_mails(
+                selected_mail,
+                candidates,
+                force=force_conversation,
+            )
+
+        if (
+            not selection["is_conversation"]
+            and allow_subject_fallback
+            and hints["include_subject"]
+            and (force_conversation or not existing_thread_slugs)
+        ):
+            candidates = fetch_conversation_candidates(
+                selected_mail,
+                fetch_lookup_ids,
+                hints["subject_hint"],
+                include_subject=True,
+                search_other_accounts=force_conversation,
+            )
+            selection = select_conversation_mails(
+                selected_mail,
+                candidates,
+                force=force_conversation,
+            )
+    _timed("conversation")
+
+    if not selection["is_conversation"]:
+        if verbose:
+            _step("   Geen betrouwbare conversation gevonden")
+            _step("")
+        result = process_mail_record(
+            selected_mail,
+            force_task=force_task,
+            no_archive=no_archive,
+            single_mode=True,
+            extra_thread_slugs=existing_thread_slugs,
+            verbose=verbose,
+        )
+        updated = 0
+        if existing_thread_slugs and result.get("slug"):
+            timeline_entries = [
+                _thread_entry_from_slug(slug) for slug in existing_thread_slugs
+            ]
+            timeline_entries.append(
+                {
+                    "slug": result["slug"],
+                    "direction": result.get("direction")
+                    or infer_mail_direction(selected_mail),
+                    "path": result.get("path", ""),
+                }
+            )
+            updated = update_conversation_thread_timeline(timeline_entries)
+            if verbose and updated:
+                _step(f"   🔗 Thread timeline bijgewerkt in {updated} notes")
+        return {
+            "mode": "single",
+            "reason": "existing-thread" if existing_thread_slugs else selection["reason"],
+            "results": [result],
+            "thread_updated": updated,
+        }
+
+    mails = selection["mails"]
+    if verbose:
+        _step(f"   Conversation: {len(mails)} mails ({selection['reason']})")
+        _step("")
+
+    selected_id = clean_message_id(selected_mail.get("message_id", "")).lower()
+    thread_slugs: list[str] = list(existing_thread_slugs)
+    results: list[dict[str, Any]] = []
+    timeline_entries: list[dict[str, Any]] = [
+        _thread_entry_from_slug(slug) for slug in existing_thread_slugs
+    ]
+    for index, mail in enumerate(mails, 1):
+        subject = mail.get("subject", "?")[:60]
+        sender = mail.get("sender_email", "?")
+        if verbose:
+            _step(f"[{index}/{len(mails)}] {subject} van {sender}")
+        mail_id = clean_message_id(mail.get("message_id", "")).lower()
+        result = process_mail_record(
+            mail,
+            force_task=force_task and mail_id == selected_id,
+            no_archive=no_archive,
+            single_mode=False,
+            extra_thread_slugs=list(thread_slugs),
+            verbose=verbose,
+            prefix="      ",
+        )
+        slug = result.get("slug")
+        if slug and slug not in thread_slugs:
+            thread_slugs.append(slug)
+        if slug:
+            timeline_entries.append(
+                {
+                    "slug": slug,
+                    "direction": result.get("direction") or infer_mail_direction(mail),
+                    "path": result.get("path", ""),
+                }
+            )
+        results.append(result)
+
+    updated = update_conversation_thread_timeline(timeline_entries)
+    if verbose and updated:
+        _step(f"   🔗 Thread timeline bijgewerkt in {updated} notes")
+
+    return {
+        "mode": "conversation",
+        "reason": selection["reason"],
+        "results": results,
+        "thread_updated": updated,
+    }
+
+
+def save_selected_mail(
+    *,
+    force_task: bool = False,
+    no_archive: bool = False,
+    single: bool = False,
+    force_conversation: bool = False,
+    client: str = MAIL_CLIENT_APPLE,
+    selected_mails: list[dict[str, Any]] | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Save selected mail messages, auto-expanding safe Apple Mail conversations."""
+    if verbose:
+        _step("📨 Fetching selected mail...")
+    resolved_client = client
+    if selected_mails is None:
+        resolved_client, selected_mails = get_selected_headers_for_client(client)
+    for mail in selected_mails:
+        mail.setdefault("mail_client", resolved_client)
+    _timed("selected")
+
+    if verbose:
+        if len(selected_mails) > 1:
+            _step(f"   {len(selected_mails)} mails geselecteerd")
+        else:
+            selected_mail = selected_mails[0]
+            _step(f"   {selected_mail.get('subject', '?')}")
+            _step(f"   From: {selected_mail.get('sender_email', '?')}")
+        _step("")
+
+    selected_mail = selected_mails[0]
+    if single:
+        if verbose:
+            _step("📝 Single mail mode")
+        with mail_client_context(resolved_client):
+            result = process_mail_record(
+                selected_mail,
+                force_task=force_task,
+                no_archive=no_archive,
+                single_mode=True,
+                verbose=verbose,
+            )
+        return {"mode": "single", "reason": "forced", "results": [result]}
+
+    if len(selected_mails) > 1:
+        with mail_client_context(resolved_client):
+            return process_selected_mail_records(
+                selected_mails,
+                force_task=force_task,
+                no_archive=no_archive,
+                force_conversation=force_conversation,
+                verbose=verbose,
+            )
+
+    with mail_client_context(resolved_client):
+        return save_mail_with_conversation(
+            selected_mail,
+            force_task=force_task,
+            no_archive=no_archive,
+            force_conversation=force_conversation,
+            verbose=verbose,
+        )
+
+
+# ── Batch Processing ───────────────────────────────────────────────────────
+
+
+def _prune_dedup_cache(max_age_days: int = 90) -> int:
+    """Remove dedup cache entries older than max_age_days. Returns pruned count."""
+    try:
+        if not _DEDUP_CACHE.exists():
+            return 0
+        cache = json.loads(_DEDUP_CACHE.read_text())
+        if not cache:
+            return 0
+        from datetime import datetime, timedelta
+
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        pruned = 0
+        new_cache = {}
+        for msg_id, slug in cache.items():
+            # Slug format: YYYYMMDD-HHMM-... — extract date from first 8 chars
+            try:
+                entry_date = datetime.strptime(slug[:8], "%Y%m%d")
+                if entry_date >= cutoff:
+                    new_cache[msg_id] = slug
+                else:
+                    pruned += 1
+            except (ValueError, IndexError):
+                new_cache[msg_id] = slug  # keep entries with unparseable dates
+        if pruned > 0:
+            _DEDUP_CACHE.write_text(json.dumps(new_cache))
+        return pruned
+    except Exception:
+        return 0
+
+
+def batch_process(as_json: bool = False, since_days: int = 7) -> list[dict]:
+    """Process inbox/sent/deleted mails sequentially. Stops on error.
+
+    since_days: only process mails newer than this many days (default 7).
+                Use 0 for no limit (process all).
+    """
+    import time
+
+    # Prune stale dedup cache entries on each batch run
+    pruned = _prune_dedup_cache()
+    if pruned > 0 and not as_json:
+        _step(f"Dedup cache: {pruned} entries ouder dan 90 dagen verwijderd")
+
+    if not is_mail_running():
+        if not as_json:
+            _step("⚠️  Mail.app is niet actief — overgeslagen")
+        return []
+
+    if since_days > 0 and not as_json:
+        from datetime import timedelta
+
+        cutoff_date = (datetime.now() - timedelta(days=since_days)).strftime("%Y-%m-%d")
+        _step(f"📅 Cutoff: mails vanaf {cutoff_date}")
+
+    # Fetch all mailboxes in one pass (7 AppleScript calls instead of 21)
+    if not as_json:
+        _step("📨 Mails ophalen...")
+    all_mailboxes = fetch_all_mailboxes(since_days=since_days)
+
+    all_results: list[dict] = []
+    mailbox_order = [
+        ("inbox", "📧", "INBOX"),
+        ("sent", "📤", "SENT"),
+        ("deleted", "📅", "DELETED (calendar)"),
+    ]
+
+    for mailbox_type, icon, label in mailbox_order:
+        mails = all_mailboxes.get(mailbox_type, [])
+
+        # Filter deleted to calendar invites only
+        if mailbox_type == "deleted":
+            mails = [m for m in mails if is_calendar_invite(m)]
+
+        # Pre-filter sent/deleted duplicates (they can't be archived, so skip silently)
+        skipped_dupes = 0
+        if mailbox_type in ("sent", "deleted") and mails:
+            dedup_cache = {}
+            try:
+                if _DEDUP_CACHE.exists():
+                    dedup_cache = json.loads(_DEDUP_CACHE.read_text())
+            except Exception:
+                pass
+            new_mails = []
+            for m in mails:
+                cached_slug = dedup_cache.get(m.get("message_id", ""))
+                if cached_slug:
+                    skipped_dupes += 1
+                    all_results.append(
+                        {
+                            "status": "duplicate",
+                            "slug": cached_slug,
+                            "mailbox_type": mailbox_type,
+                            "batch": True,
+                        }
+                    )
+                else:
+                    new_mails.append(m)
+            mails = new_mails
+
+        if not mails:
+            if skipped_dupes and not as_json:
+                _step(f"\n── {label} ── {skipped_dupes} al verwerkt, 0 nieuw")
+            continue
+
+        should_archive = mailbox_type == "inbox"
+
+        suffix = f" (+{skipped_dupes} al verwerkt)" if skipped_dupes else ""
+        if not as_json:
+            _step(f"\n── {label} ({len(mails)} mails{suffix}) ──")
+
+        for i, mail in enumerate(mails, 1):
+            t0 = time.time()
+            subject = mail.get("subject", "?")[:60]
+            sender = mail.get("sender_email", "?")
+            is_flagged = mail.get("is_flagged", False)
+            flag_marker = " ⚑" if is_flagged else ""
+
+            if not as_json:
+                _step(
+                    f'[{i}/{len(mails)}] {icon} "{subject}" van {sender}{flag_marker}'
+                )
+
+            # 1. Dedup
+            existing = is_duplicate(mail["message_id"])
+            if existing:
+                if not as_json:
+                    _step(f"      ♻️  al verwerkt → [[{existing}]]")
+                # Archive dupes from inbox so they leave the inbox
+                if should_archive:
+                    try:
+                        archive_mail(
+                            mail["message_id"],
+                            mail["account"],
+                            mailbox=mail.get("mailbox", ""),
+                        )
+                        if not as_json:
+                            _step("      📦 Archive... OK")
+                    except Exception:
+                        pass
+                all_results.append(
+                    {
+                        "status": "duplicate",
+                        "slug": existing,
+                        "mailbox_type": mailbox_type,
+                        "batch": True,
+                    }
+                )
+                continue
+
+            # 2. Fetch body
+            if not as_json:
+                _step("      🔍 Dedup... nieuw")
+            mail["body"] = fetch_mail_body(
+                mail["message_id"],
+                account=mail.get("account", ""),
+                mailbox=mail.get("mailbox", ""),
+            )
+
+            # 3. Create note (+ task if flagged inbox)
+            create_task = should_create_follow_up_task(
+                mail, mailbox_type=mailbox_type
+            )
+            try:
+                result = create_mail_note(mail, create_task=create_task)
+            except Exception as e:
+                _step(f"      ❌ Note creation failed: {e}")
+                _write_log(
+                    {
+                        "status": "error",
+                        "message": str(e),
+                        "subject": subject,
+                        "mailbox_type": mailbox_type,
+                        "batch": True,
+                    }
+                )
+                raise RuntimeError(
+                    f'Batch gestopt bij [{i}/{len(mails)}] "{subject}": {e}'
+                )
+
+            if not as_json:
+                _step(f"      📝 → [[{result['slug']}]]")
+
+            if result.get("task_slug") and not as_json:
+                _step(f"      📋 Task → [[{result['task_slug']}]]")
+
+            # 4. Archive (inbox only)
+            if should_archive:
+                try:
+                    archive_result = archive_mail(
+                        mail["message_id"],
+                        mail["account"],
+                        mailbox=mail.get("mailbox", ""),
+                    )
+                except Exception as e:
+                    archive_result = f"ERROR:{e}"
+
+                result["archived"] = archive_result
+                result["archive_account"] = mail.get("account", "")
+                result["archive_mailbox"] = mail.get("mailbox", "")
+                if archive_result != "OK":
+                    result["archive_error"] = archive_result
+
+                if not as_json:
+                    if archive_result == "OK":
+                        _step("      📦 Archive... OK")
+                    else:
+                        _step(f"      ⚠️  Archive overgeslagen: {archive_result}")
+
+            elapsed = time.time() - t0
+            if not as_json:
+                _step(f"      ✅ ({elapsed:.1f}s)")
+
+            # 5. Log
+            result["status"] = "saved"
+            result["mailbox_type"] = mailbox_type
+            result["batch"] = True
+            _write_log(result)
+            all_results.append(result)
+
+    return all_results
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+
+_LOG_PATH = brain_lib.ROOT / "context" / "observability" / "save-mail.jsonl"
+_t0 = 0.0
+_timings: dict[str, float] = {}
+
+
+def _step(msg: str) -> None:
+    """Print a progress step (flushed for real-time Raycast output)."""
+    print(msg, flush=True)
+
+
+def _timed(label: str) -> float:
+    """Record timing for a step. Returns elapsed ms since last call."""
+    import time
+
+    if _t0 <= 0:
+        return 0.0
+    now = time.time()
+    elapsed = (now - _t0) * 1000
+    _timings[label] = elapsed
+    return elapsed
+
+
+def _write_log(entry: dict) -> None:
+    """Append a JSON log entry to the save-mail log."""
+    try:
+        log = {**entry, "timings": dict(_timings), "ts": datetime.now().isoformat()}
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def main() -> None:
+    import argparse
+    import time
+
+    global _t0
+    _t0 = time.time()
+
+    parser = argparse.ArgumentParser(description="Save selected mail to vault")
+    parser.add_argument("--task", action="store_true", help="Create follow-up task")
+    parser.add_argument("--no-archive", action="store_true", help="Skip archiving")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument(
+        "--client",
+        choices=MAIL_CLIENTS,
+        default=MAIL_CLIENT_AUTO,
+        help="Mail client to read from (default: auto)",
+    )
+    parser.add_argument(
+        "--single",
+        action="store_true",
+        help="Force old single-message behavior",
+    )
+    parser.add_argument(
+        "--conversation",
+        action="store_true",
+        help="Force conversation lookup even when confidence is low",
+    )
+    args = parser.parse_args()
+    verbose = not args.json
+
+    if args.single and args.conversation:
+        parser.error("--single and --conversation cannot be used together")
+
+    if verbose:
+        _step(f"▶ Script: {Path(__file__).resolve()}")
+        _step(f"🧾 Log: {_LOG_PATH.resolve()}")
+
+    try:
+        outcome = save_selected_mail(
+            force_task=args.task,
+            no_archive=args.no_archive,
+            single=args.single,
+            force_conversation=args.conversation,
+            client=args.client,
+            verbose=verbose,
+        )
+        total_ms = _timed("total")
+        if args.json:
+            print(json.dumps(outcome, default=str))
+        else:
+            results = outcome["results"]
+            saved = [r for r in results if r.get("status") == "saved"]
+            dupes = [r for r in results if r.get("status") == "duplicate"]
+            _step("━" * 40)
+            if outcome["mode"] == "conversation":
+                _step(
+                    f"✅ Conversation klaar: {len(saved)} opgeslagen, "
+                    f"{len(dupes)} al verwerkt ({total_ms / 1000:.1f}s)"
+                )
+            elif outcome["mode"] == "selection":
+                _step(
+                    f"✅ Selectie klaar: {len(saved)} opgeslagen, "
+                    f"{len(dupes)} al verwerkt ({total_ms / 1000:.1f}s)"
+                )
+            else:
+                result = results[0]
+                if result.get("status") == "duplicate":
+                    _step(f"✅ Al verwerkt: [[{result['slug']}]]")
+                else:
+                    _step(f"✅ [[{result['slug']}]]  ({total_ms / 1000:.1f}s)")
+
+    except RuntimeError as e:
+        error_msg = str(e)
+        _timed("error")
+        _write_log({"status": "error", "message": error_msg})
+        if args.json:
+            print(json.dumps({"status": "error", "message": error_msg}))
+        else:
+            _step(f"\n❌ {error_msg}")
+        sys.exit(1)
+    except Exception as e:
+        _timed("error")
+        _write_log({"status": "error", "message": str(e)})
+        if args.json:
+            print(json.dumps({"status": "error", "message": str(e)}))
+        else:
+            _step(f"\n❌ {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

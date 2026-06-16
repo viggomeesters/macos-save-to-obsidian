@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macos-mail-to-obsidian"
+version = "0.1.0"
+description = "Standalone macOS Mail/Outlook to Obsidian capture utilities"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+]
