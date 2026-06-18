@@ -1596,6 +1596,14 @@ class TestMailSlugCreation:
         assert ts == "20260516-1345"
         assert slug == "20260516-1345-mail-anne-project-update-2"
 
+    def test_clean_mail_subject_strips_reply_and_noise_prefixes(self) -> None:
+        assert (
+            save_mail.clean_mail_subject("Re: [External] Project Update")
+            == "Project Update"
+        )
+        assert save_mail.clean_mail_subject("FW:   Newsletter") == "Newsletter"
+        assert save_mail.clean_mail_subject("") == "Geen onderwerp"
+
     def test_display_only_outlook_sender_is_used_for_entity_slug(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -1831,6 +1839,8 @@ class TestSavedDataSize:
         assert "enrichment_version: 0" in content
         assert 'raw_subject: "Re: Project Update"' in content
         assert "clean_subject: Project Update" in content
+        assert "title: Project Update" in content
+        assert "# 📥 Project Update" in content
         assert "sender_domain: example.com" in content
 
 

@@ -347,6 +347,12 @@ def normalize_subject(subject: str) -> str:
 def clean_mail_subject(subject: str) -> str:
     """Return a conservative display/search subject while preserving raw_subject."""
     cleaned = strip_reply_prefixes(subject or "")
+    cleaned = re.sub(
+        r"^\s*(\[(external|extern|ext|spam|bulk)\]\s*)+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or (subject or "Geen onderwerp").strip() or "Geen onderwerp"
 
@@ -906,7 +912,7 @@ def create_mail_note(
         if thread_slug not in thread_slugs:
             thread_slugs.append(thread_slug)
 
-    slug, ts = make_slug(dt, entity_slug, subject)
+    slug, ts = make_slug(dt, entity_slug, clean_subject)
     filepath = brain_lib.canonical_note_path(
         MAIL_NOTE_TYPE, slug, ts, create_parent=True
     )
@@ -917,6 +923,7 @@ def create_mail_note(
     date_display = dt.strftime("%-d %b %Y at %H:%M")
     emoji = "📤" if direction == "sent" else "📥"
     escaped_subject = escape_title(subject)
+    escaped_clean_subject = escape_title(clean_subject)
 
     # Save attachments
     att_links: list[str] = []
@@ -945,7 +952,7 @@ def create_mail_note(
         "area": area,
         "capture_source": MAIL_CAPTURE_SOURCE,
         "capture_version": MAIL_CAPTURE_VERSION,
-        "clean_subject": escape_title(clean_subject),
+        "clean_subject": escaped_clean_subject,
         "direction": direction,
         "enrichment_status": MAIL_ENRICHMENT_STATUS_PENDING,
         "enrichment_version": MAIL_ENRICHMENT_VERSION,
@@ -960,7 +967,7 @@ def create_mail_note(
         "sender_domain": sender_domain,
         "source_account": mail.get("account", ""),
         "source_mailbox": mail.get("mailbox", ""),
-        "title": escaped_subject,
+        "title": escaped_clean_subject,
         "to": to_emails,
         "topics": topics,
         "topics_confidence": topics_confidence,
@@ -998,7 +1005,7 @@ def create_mail_note(
 
     body_lines = [
         "",
-        f"# {emoji} {subject}",
+            f"# {emoji} {clean_subject}",
         "",
         from_line,
         to_line,
