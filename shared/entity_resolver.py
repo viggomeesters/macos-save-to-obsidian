@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import brain_lib
@@ -167,6 +168,14 @@ _topic_pattern: re.Pattern[str] | None = None
 _cache_loaded = False
 
 
+@dataclass(frozen=True)
+class EntityResolution:
+    slug: str
+    direction: str
+    source: str
+    confidence: float
+
+
 def _load_entity_cache() -> None:
     """One-shot load: email→entity, domain→entity, entity→topics, all topics."""
     global _cache_loaded, _topic_pattern
@@ -265,7 +274,15 @@ def _load_entity_cache() -> None:
 def resolve_entity(
     email: str, to_emails: str | None = None, *, fallback_fn=None
 ) -> tuple[str, str]:
-    """Resolve email to (entity_slug, direction). Fast path first.
+    """Resolve email to (entity_slug, direction). Fast path first."""
+    result = resolve_entity_details(email, to_emails, fallback_fn=fallback_fn)
+    return result.slug, result.direction
+
+
+def resolve_entity_details(
+    email: str, to_emails: str | None = None, *, fallback_fn=None
+) -> EntityResolution:
+    """Resolve email to entity metadata, including source and confidence.
 
     If *fallback_fn* is provided and no cached/mapped match is found, it is
     called with the email address.  It should return a ``(slug, direction)``
@@ -275,29 +292,34 @@ def resolve_entity(
     email_lower = email.lower().strip()
 
     if "@" not in email_lower:
-        return "unknown-sender", "received"
+        return EntityResolution("unknown-sender", "received", "missing-email", 0.0)
 
     if email_lower in SELF_EMAILS:
         if to_emails:
             first_to = to_emails.split(",")[0].strip().lower()
             if first_to and first_to not in SELF_EMAILS:
-                entity, _ = resolve_entity(first_to, fallback_fn=fallback_fn)
-                return entity, "sent"
-        return "viggo-meesters", "sent"
+                recipient = resolve_entity_details(first_to, fallback_fn=fallback_fn)
+                return EntityResolution(
+                    recipient.slug,
+                    "sent",
+                    f"sent-recipient:{recipient.source}",
+                    min(recipient.confidence, 0.95),
+                )
+        return EntityResolution("viggo-meesters", "sent", "self-email", 1.0)
 
     if email_lower in ENTITY_MAP:
-        return ENTITY_MAP[email_lower], "received"
+        return EntityResolution(ENTITY_MAP[email_lower], "received", "known-email-map", 1.0)
 
     if email_lower in _email_cache:
-        return _email_cache[email_lower], "received"
+        return EntityResolution(_email_cache[email_lower], "received", "vault-email", 1.0)
 
     if "privaterelay.appleid.com" in email_lower:
         for key, slug in RELAY_MAP.items():
             if key in email_lower:
-                return slug, "received"
+                return EntityResolution(slug, "received", "apple-relay-map", 0.9)
         slug = _derive_entity_from_relay_local(email_lower.split("@", 1)[0])
         if slug:
-            return slug, "received"
+            return EntityResolution(slug, "received", "apple-relay-derived", 0.75)
 
     domain = email_lower.split("@")[-1]
     local = email_lower.split("@")[0]
@@ -305,14 +327,14 @@ def resolve_entity(
         slug = _derive_entity_from_relay_local(local)
         if slug:
             if slug in _domain_cache:
-                return _domain_cache[slug], "received"
-            return slug, "received"
+                return EntityResolution(_domain_cache[slug], "received", "vault-domain-relay", 0.9)
+            return EntityResolution(slug, "received", "icloud-relay-derived", 0.75)
 
     if domain not in GENERIC_PROVIDERS and _is_likely_person(local):
         slug = _derive_entity_from_local_part(local)
         if email_lower not in SELF_EMAILS:
             _ensure_entity_exists(slug, email_lower, domain, category="person")
-        return slug, "received"
+        return EntityResolution(slug, "received", "derived-person-local-part", 0.7)
 
     # Domain-based cache lookup (only for non-generic providers)
     if domain not in GENERIC_PROVIDERS:
@@ -323,13 +345,14 @@ def resolve_entity(
         candidates.append(parts[0])
         for d_key in candidates:
             if d_key in _domain_cache:
-                return _domain_cache[d_key], "received"
+                return EntityResolution(_domain_cache[d_key], "received", "vault-domain", 0.9)
 
     # Try custom fallback before smart parsing
     if fallback_fn is not None:
         result = fallback_fn(email_lower)
         if result is not None:
-            return result
+            slug, direction = result
+            return EntityResolution(slug, direction, "custom-fallback", 0.6)
 
     # Smart fallback: derive entity slug from email address
     slug = _derive_entity_from_email(email_lower)
@@ -338,7 +361,7 @@ def resolve_entity(
     if email_lower not in SELF_EMAILS:
         _ensure_entity_exists(slug, email_lower, domain)
 
-    return slug, "received"
+    return EntityResolution(slug, "received", "derived-email", 0.55)
 
 
 def _derive_entity_from_email(email: str) -> str:

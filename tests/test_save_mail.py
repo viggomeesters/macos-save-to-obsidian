@@ -1630,15 +1630,56 @@ class TestMailSlugCreation:
         )
 
         assert result["entity"] == "askit-servicenow"
+        assert result["entity_source"] == "outlook-display-name"
+        assert result["entity_confidence"] == 0.65
         assert result["slug"] == "20260617-1101-mail-askit-servicenow-askit-je-aanvraag"
         content = Path(result["path"]).read_text(encoding="utf-8")
         assert 'entity: ["askit-servicenow"]' in content
+        assert "entity_source: outlook-display-name" in content
+        assert "entity_confidence: 0.65" in content
         assert "to: viggo.meesters@bam.com" in content
         assert "📧 From: [[askit-servicenow]] (askit servicenow)" in content
         assert "📬 To: viggo.meesters@bam.com" in content
         entity_content = (entities / "askit-servicenow.md").read_text(encoding="utf-8")
         assert "source: auto-created-from-outlook-display-name" in entity_content
         assert "title: AskIT ServiceNow" in entity_content
+
+
+class TestEntityResolutionMetadata:
+    def test_known_email_map_records_exact_source(self) -> None:
+        result = save_mail.resolve_entity_details("noreply@email.openai.com")
+
+        assert result.slug == "openai"
+        assert result.direction == "received"
+        assert result.source == "known-email-map"
+        assert result.confidence == 1.0
+
+    def test_self_sent_mail_uses_recipient_entity_source(self) -> None:
+        result = save_mail.resolve_entity_details(
+            "viggomeesters@icloud.com",
+            "person@example.com",
+        )
+
+        assert result.slug == "example"
+        assert result.direction == "sent"
+        assert result.source.startswith("sent-recipient:")
+        assert result.confidence <= 0.95
+
+    def test_relay_map_records_relay_source(self) -> None:
+        result = save_mail.resolve_entity_details(
+            "anything-instant-gaming@privaterelay.appleid.com"
+        )
+
+        assert result.slug == "instant-gaming"
+        assert result.source == "apple-relay-map"
+        assert result.confidence == 0.9
+
+    def test_missing_email_records_unknown_source(self) -> None:
+        result = save_mail.resolve_entity_details("AskIT ServiceNow")
+
+        assert result.slug == "unknown-sender"
+        assert result.source == "missing-email"
+        assert result.confidence == 0.0
 
 
 class TestFollowUpTaskCreation:

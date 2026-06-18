@@ -30,7 +30,12 @@ if str(REPO_SHARED) not in sys.path:
     sys.path.insert(0, str(REPO_SHARED))
 import brain_lib
 
-from entity_resolver import SELF_EMAILS, resolve_entity, suggest_topics
+from entity_resolver import (
+    SELF_EMAILS,
+    resolve_entity,
+    resolve_entity_details,
+    suggest_topics,
+)
 from mail_project_rules import MailProjectMatch, resolve_mail_project
 import mail_applescript
 from mail_applescript import (
@@ -862,13 +867,19 @@ def create_mail_note(
     calendar_invite = is_calendar_invite(mail)
     sender_domain = _email_domain(sender_email)
 
-    entity_slug, direction = resolve_entity(sender_email, to_emails)
+    entity_resolution = resolve_entity_details(sender_email, to_emails)
+    entity_slug = entity_resolution.slug
+    direction = entity_resolution.direction
+    entity_source = entity_resolution.source
+    entity_confidence = entity_resolution.confidence
     if entity_slug == "unknown-sender" and "@" not in sender_email:
         display_slug = _entity_slug_from_display_name(
             mail.get("sender_display", "") or sender_email
         )
         if display_slug:
             entity_slug = display_slug
+            entity_source = "outlook-display-name"
+            entity_confidence = 0.65
             _ensure_display_entity_note(
                 entity_slug,
                 mail.get("sender_display", "") or sender_email,
@@ -933,6 +944,8 @@ def create_mail_note(
         "enrichment_status": MAIL_ENRICHMENT_STATUS_PENDING,
         "enrichment_version": MAIL_ENRICHMENT_VERSION,
         "entity": [entity_slug],
+        "entity_confidence": entity_confidence,
+        "entity_source": entity_source,
         "from": sender_email,
         "mail_link": f"message://<{message_id}>",
         "mail_client": mail_client,
@@ -1031,6 +1044,8 @@ def create_mail_note(
     result = {
         "slug": slug,
         "entity": entity_slug,
+        "entity_source": entity_source,
+        "entity_confidence": entity_confidence,
         "direction": direction,
         "area": area,
         "project": project,
