@@ -1682,6 +1682,69 @@ class TestEntityResolutionMetadata:
         assert result.confidence == 0.0
 
 
+class TestProjectTopicRoutingMetadata:
+    def test_mail_note_records_project_slug_code_and_topic_sources(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        vault = tmp_path / "vault"
+        notes = vault / "10_notes"
+        monkeypatch.setattr(save_mail.brain_lib.cfg, "vault_root", vault)
+        monkeypatch.setattr(save_mail.brain_lib.cfg, "vault_notes", notes)
+        monkeypatch.setattr(save_mail.brain_lib, "link_note_in_daily", lambda *a, **k: None)
+        monkeypatch.setattr(
+            save_mail.brain_lib,
+            "resolve_project_code",
+            lambda slug: "mailcap" if slug == "2026-06-mail-capture" else slug,
+        )
+        monkeypatch.setattr(save_mail, "suggest_topics", lambda *a, **k: ["obsidian"])
+        monkeypatch.setattr(
+            save_mail,
+            "detect_mail_project",
+            lambda mail: mail_project_rules.MailProjectMatch(
+                project="2026-06-mail-capture",
+                area="self",
+                source="mail_code",
+                confidence=0.9,
+                matched="mailcap",
+            ),
+        )
+
+        result = save_mail.create_mail_note(
+            {
+                "subject": "Project Update",
+                "sender_email": "person@example.com",
+                "sender_display": "Person Example",
+                "date_str": "2026-05-01 10:00:00",
+                "message_id": "routing@example.com",
+                "account": "iCloud",
+                "mailbox": "Inbox",
+                "to": "viggomeesters@icloud.com",
+                "cc": "",
+                "att_count": "0",
+                "att_names": "",
+                "is_flagged": False,
+                "all_headers": "",
+                "mailbox_type": "inbox",
+                "body": "Saved body.",
+            }
+        )
+
+        assert result["project"] == "mailcap"
+        assert result["project_slug"] == "2026-06-mail-capture"
+        assert result["project_source"] == "mail_code"
+        assert result["project_confidence"] == 0.9
+        assert result["topics"] == ["obsidian"]
+        assert result["topics_source"] == "entity-or-subject"
+        assert result["topics_confidence"] == 0.7
+
+        content = Path(result["path"]).read_text(encoding="utf-8")
+        assert "project: mailcap" in content
+        assert "project_slug: 2026-06-mail-capture" in content
+        assert "project_source: mail_code" in content
+        assert "topics_source: entity-or-subject" in content
+        assert "topics_confidence: 0.7" in content
+
+
 class TestFollowUpTaskCreation:
     def test_uses_task_prefix(self, tmp_path, monkeypatch) -> None:
         class FixedDateTime(datetime):

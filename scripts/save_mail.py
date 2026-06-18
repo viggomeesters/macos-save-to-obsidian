@@ -896,6 +896,10 @@ def create_mail_note(
         if project_match and not project_match.is_ambiguous
         else None
     )
+    project_slug = project
+    project_code = (
+        brain_lib.resolve_project_code(project_slug) if project_slug else None
+    )
 
     thread_slugs = find_thread_notes(entity_slug, subject)
     for thread_slug in extra_thread_slugs or []:
@@ -927,9 +931,11 @@ def create_mail_note(
         )
 
     # Build frontmatter
-    topics = suggest_topics(entity_slug, subject)
-    if calendar_invite:
-        topics = sorted({*topics, "calendar"})
+    topics, topics_source, topics_confidence = _topic_routing_metadata(
+        entity_slug,
+        subject,
+        calendar_invite=calendar_invite,
+    )
     fm: dict[str, Any] = {
         "type": "interaction",
         "category": "mail",
@@ -957,14 +963,18 @@ def create_mail_note(
         "title": escaped_subject,
         "to": to_emails,
         "topics": topics,
+        "topics_confidence": topics_confidence,
+        "topics_source": topics_source,
     }
     if calendar_invite:
         fm["calendar_invite"] = True
-    if project:
-        fm["project"] = project
+    if project_slug:
+        fm["project"] = project_code
+        fm["project_slug"] = project_slug
         if project_match:
             fm["project_source"] = project_match.source
             fm["project_confidence"] = project_match.confidence
+            fm["project_match"] = project_match.matched
     if mail.get("cc"):
         fm["cc"] = mail["cc"]
     if att_links:
@@ -1048,8 +1058,11 @@ def create_mail_note(
         "entity_confidence": entity_confidence,
         "direction": direction,
         "area": area,
-        "project": project,
+        "project": project_code,
+        "project_slug": project_slug,
         "topics": topics,
+        "topics_source": topics_source,
+        "topics_confidence": topics_confidence,
         "thread": thread_slugs,
         "attachments": len(att_links),
         "subject": subject,
@@ -1076,7 +1089,7 @@ def create_mail_note(
             entity_slug=entity_slug,
             mail_slug=slug,
             area=area,
-            project=project,
+            project=project_code,
         )
         result["task_slug"] = task_result["slug"]
         result["task_path"] = task_result["path"]
@@ -1253,6 +1266,27 @@ def _email_domain(value: str) -> str:
     if "@" not in value:
         return ""
     return value.rsplit("@", 1)[-1]
+
+
+def _topic_routing_metadata(
+    entity_slug: str,
+    subject: str,
+    *,
+    calendar_invite: bool,
+) -> tuple[list[str], str, float]:
+    topics = set(suggest_topics(entity_slug, subject))
+    sources: list[str] = []
+    confidences: list[float] = []
+    if topics:
+        sources.append("entity-or-subject")
+        confidences.append(0.7)
+    if calendar_invite:
+        topics.add("calendar")
+        sources.append("calendar-invite")
+        confidences.append(1.0)
+    if not topics:
+        return [], "none", 0.0
+    return sorted(topics), ",".join(sources), max(confidences)
 
 
 def _effective_to_emails(mail: dict[str, Any], mailbox_type: str) -> str:
