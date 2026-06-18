@@ -267,6 +267,68 @@ class TestConversationDetection:
         assert not hints["include_subject"]
         assert conversation_lookup_ids(selected) == []
 
+    def test_thread_metadata_uses_references_root(self) -> None:
+        mail = _mail(
+            "c@example.com",
+            "Re: Project Update",
+            headers=(
+                "Message-ID: <c@example.com>\n"
+                "In-Reply-To: <b@example.com>\n"
+                "References: <a@example.com> <b@example.com>\n"
+            ),
+        )
+
+        metadata = save_mail.mail_thread_metadata(mail)
+
+        assert metadata["thread_id"] == "message-id:a@example.com"
+        assert metadata["thread_source"] == "references"
+        assert metadata["root_message_id"] == "a@example.com"
+        assert metadata["in_reply_to"] == "b@example.com"
+        assert metadata["references"] == ["a@example.com", "b@example.com"]
+
+    def test_thread_metadata_uses_outlook_thread_index(self) -> None:
+        mail = _mail(
+            "a@example.com",
+            "Project Update",
+            headers=(
+                "Message-ID: <a@example.com>\n"
+                "Thread-Topic: Project Update\n"
+                "Thread-Index: Acabcd1234567890abcd1234567890abcd1234567890extra\n"
+            ),
+        )
+
+        metadata = save_mail.mail_thread_metadata(mail)
+
+        assert metadata["thread_source"] == "thread-index"
+        assert metadata["thread_id"].startswith("thread-index:")
+        assert metadata["thread_topic"] == "project update"
+        assert len(metadata["thread_index_root"]) == 44
+
+    def test_thread_metadata_allows_safe_reply_subject_fallback(self) -> None:
+        mail = _mail(
+            "b@example.com",
+            "Re: Project Update",
+            headers="Message-ID: <b@example.com>\n",
+        )
+
+        metadata = save_mail.mail_thread_metadata(mail)
+
+        assert metadata["thread_source"] == "reply-subject-participants"
+        assert metadata["thread_id"].startswith("subject-participants:")
+
+    def test_thread_metadata_avoids_generic_newsletter_fallback(self) -> None:
+        mail = _mail(
+            "b@example.com",
+            "Newsletter",
+            sender="news@example.com",
+            headers="Message-ID: <b@example.com>\n",
+        )
+
+        metadata = save_mail.mail_thread_metadata(mail)
+
+        assert metadata["thread_id"] == ""
+        assert metadata["thread_source"] == ""
+
 
 class TestDeduplication:
     def test_empty_message_id_is_never_duplicate(

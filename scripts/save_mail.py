@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import re
 import sys
@@ -459,6 +460,73 @@ def _thread_index_root(value: str) -> str:
     if not compact:
         return ""
     return compact[:44] if len(compact) >= 44 else compact
+
+
+def mail_thread_metadata(mail: dict[str, Any]) -> dict[str, Any]:
+    """Return stable thread metadata when headers or safe fallback provide evidence."""
+    headers = parse_mail_headers(mail.get("all_headers", ""))
+    references = extract_message_ids(headers.get("references", ""))
+    in_reply_to = extract_message_ids(headers.get("in-reply-to", ""))
+    thread_topic = headers.get("thread-topic", "")
+    thread_index_root = _thread_index_root(headers.get("thread-index", ""))
+    message_ids = conversation_message_ids(mail)
+
+    metadata: dict[str, Any] = {
+        "references": references,
+        "in_reply_to": in_reply_to[0] if in_reply_to else "",
+        "root_message_id": "",
+        "thread_id": "",
+        "thread_source": "",
+        "thread_topic": normalize_subject(thread_topic) if thread_topic else "",
+        "thread_index_root": thread_index_root,
+    }
+
+    if references:
+        root = references[0]
+        metadata.update(
+            {
+                "root_message_id": root,
+                "thread_id": f"message-id:{root.lower()}",
+                "thread_source": "references",
+            }
+        )
+        return metadata
+
+    if in_reply_to:
+        root = in_reply_to[0]
+        metadata.update(
+            {
+                "root_message_id": root,
+                "thread_id": f"message-id:{root.lower()}",
+                "thread_source": "in-reply-to",
+            }
+        )
+        return metadata
+
+    if thread_index_root:
+        metadata.update(
+            {
+                "root_message_id": message_ids[-1] if message_ids else "",
+                "thread_id": f"thread-index:{thread_index_root.lower()}",
+                "thread_source": "thread-index",
+            }
+        )
+        return metadata
+
+    subject = normalize_subject(mail.get("subject", ""))
+    participants = sorted(_external_participants(mail))
+    if has_reply_prefix(mail.get("subject", "")) and subject and participants:
+        if not is_generic_subject(subject):
+            raw_key = "|".join([subject, *participants])
+            digest = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:16]
+            metadata.update(
+                {
+                    "root_message_id": message_ids[-1] if message_ids else "",
+                    "thread_id": f"subject-participants:{digest}",
+                    "thread_source": "reply-subject-participants",
+                }
+            )
+    return metadata
 
 
 def _is_self_email(email: str) -> bool:
@@ -943,6 +1011,7 @@ def create_mail_note(
         subject,
         calendar_invite=calendar_invite,
     )
+    thread_metadata = mail_thread_metadata(mail)
     fm: dict[str, Any] = {
         "type": "interaction",
         "category": "mail",
@@ -992,6 +1061,19 @@ def create_mail_note(
         fm["attachments"] = att_names
     if thread_slugs:
         fm["thread"] = thread_slugs
+    if thread_metadata.get("thread_id"):
+        fm["thread_id"] = thread_metadata["thread_id"]
+        fm["thread_source"] = thread_metadata["thread_source"]
+        if thread_metadata.get("root_message_id"):
+            fm["root_message_id"] = thread_metadata["root_message_id"]
+        if thread_metadata.get("in_reply_to"):
+            fm["in_reply_to"] = thread_metadata["in_reply_to"]
+        if thread_metadata.get("references"):
+            fm["references"] = thread_metadata["references"]
+        if thread_metadata.get("thread_topic"):
+            fm["thread_topic"] = thread_metadata["thread_topic"]
+        if thread_metadata.get("thread_index_root"):
+            fm["thread_index_root"] = thread_metadata["thread_index_root"]
 
     # Build body
     if direction == "sent":
@@ -1071,6 +1153,13 @@ def create_mail_note(
         "topics_source": topics_source,
         "topics_confidence": topics_confidence,
         "thread": thread_slugs,
+        "thread_id": thread_metadata.get("thread_id", ""),
+        "thread_source": thread_metadata.get("thread_source", ""),
+        "root_message_id": thread_metadata.get("root_message_id", ""),
+        "in_reply_to": thread_metadata.get("in_reply_to", ""),
+        "references": thread_metadata.get("references", []),
+        "thread_topic": thread_metadata.get("thread_topic", ""),
+        "thread_index_root": thread_metadata.get("thread_index_root", ""),
         "attachments": len(att_links),
         "subject": subject,
         "raw_subject": subject,
