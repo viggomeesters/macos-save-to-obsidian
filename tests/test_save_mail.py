@@ -10,10 +10,13 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "shared"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import mail_applescript
+import mail_outlook_applescript
+import mail_project_rules
 import save_mail
 from save_mail import (
     conversation_fetch_hints,
@@ -524,6 +527,159 @@ class TestThreadTimeline:
         assert 'thread: ["20260501-1640-mail-root", "20260504-1024-mail-followup"]' in reply
 
 
+class TestOutlookClipboardParsing:
+    def test_rtf_clipboard_payload_coerces_to_outlook_record(self) -> None:
+        raw = (
+            r"{\rtf1\ansi From: Jane Example <jane@example.com>\par "
+            r"Subject: Planning update\par "
+            r"Date: 16 June 2026 12:00:00\par "
+            r"To: Viggo <viggo@example.com>\par\par Body line one\par Body line two}"
+        )
+
+        record = mail_outlook_applescript._coerce_outlook_record_from_clipboard(raw)
+
+        assert record is not None
+        assert record["subject"] == "Planning update"
+        assert record["sender_email"] == "jane@example.com"
+        assert record["to"] == "viggo@example.com"
+        assert "Body line one" in record["body"]
+
+    def test_tab_separated_clipboard_headers_are_parsed(self) -> None:
+        raw = "\n".join(
+            [
+                "From\tJane Example <jane@example.com>",
+                "Sent\t16 June 2026 12:00:00",
+                "To\tViggo <viggo@example.com>",
+                "Subject\tPlanning update",
+                "",
+                "Body line",
+            ]
+        )
+
+        record = mail_outlook_applescript._coerce_outlook_record_from_clipboard(raw)
+
+        assert record is not None
+        assert record["subject"] == "Planning update"
+        assert record["sender_email"] == "jane@example.com"
+        assert record["date_str"] == "16 June 2026 12:00:00"
+        assert record["body"] == "Body line"
+
+    def test_clipboard_reader_uses_rtf_candidate_when_plain_text_is_not_mail(
+        self,
+    ) -> None:
+        raw_rtf = (
+            r"{\rtf1\ansi From: Jane Example <jane@example.com>\par "
+            r"Subject: Planning update}"
+        )
+
+        def fake_run(cmd: list[str], **kwargs) -> SimpleNamespace:
+            if cmd == ["/usr/bin/pbpaste", "-Prefer", "rtf"]:
+                return SimpleNamespace(returncode=0, stdout=raw_rtf)
+            return SimpleNamespace(returncode=0, stdout="not a mail payload")
+
+        with patch("mail_outlook_applescript.subprocess.run", side_effect=fake_run):
+            text = mail_outlook_applescript._clipboard_paste_prefer_rich()
+
+        assert "From: Jane Example <jane@example.com>" in text
+        assert "Subject: Planning update" in text
+
+    def test_new_outlook_accessibility_row_parses_message_metadata(self) -> None:
+        row = (
+            "Jane Example, Planning update,     16/06/2026,        "
+            "Hi Viggo, this is the message preview."
+        )
+
+        record = mail_outlook_applescript._parse_new_outlook_ax_row(
+            row,
+            window_title="Inbox • jane@example.com",
+        )
+
+        assert record is not None
+        assert record["subject"] == "Planning update"
+        assert record["sender_display"] == "Jane Example"
+        assert record["date_str"] == "16/06/2026"
+        assert record["mailbox"] == "Inbox"
+        assert record["account"] == "jane@example.com"
+        assert record["body"] == "Hi Viggo, this is the message preview."
+        assert record["capture_source"] == "outlook-accessibility"
+
+    def test_new_outlook_accessibility_row_parses_conversation_prefix(self) -> None:
+        row = (
+            "7 messages, Leo van Horrik, Alba Colitti, Gebruiker Viggo Meesters, "
+            "Projectvraag,     10/06/2026,        Hi Alba, kun jij kijken?"
+        )
+
+        record = mail_outlook_applescript._parse_new_outlook_ax_row(row)
+
+        assert record is not None
+        assert record["sender_display"] == "Leo van Horrik, Alba Colitti, Gebruiker Viggo Meesters"
+        assert record["subject"] == "Projectvraag"
+
+    def test_raycast_output_is_not_treated_as_outlook_mail(self) -> None:
+        raw = "Running: scripts/raycast/save-outlook-mail.sh\n▶ Script: scripts/save_mail.py"
+
+        assert not mail_outlook_applescript._looks_like_message_copy(raw)
+        assert mail_outlook_applescript._coerce_outlook_record_from_clipboard(raw) is None
+
+
+class TestMailProjectDetection:
+    def test_short_project_code_does_not_match_common_word_in_subject(self) -> None:
+        index = {
+            "addresses": {},
+            "domains": {},
+            "subject_rules": [],
+            "codes": {
+                "je": {
+                    "project": "2025-12-journal-extension",
+                    "area": "work",
+                    "code": "je",
+                    "source": "project_code",
+                }
+            },
+            "conflicts": {},
+        }
+
+        match = mail_project_rules.resolve_mail_project(
+            {
+                "subject": "AskIT: Je Request REQ0116499 is Afgehandeld",
+                "sender_email": "askit servicenow",
+                "sender_display": "askit servicenow",
+            },
+            index=index,
+        )
+
+        assert match is None
+
+    def test_short_explicit_mail_code_can_still_match_subject(self) -> None:
+        index = {
+            "addresses": {},
+            "domains": {},
+            "subject_rules": [],
+            "codes": {
+                "je": {
+                    "project": "2025-12-journal-extension",
+                    "area": "work",
+                    "code": "je",
+                    "source": "mail_code",
+                }
+            },
+            "conflicts": {},
+        }
+
+        match = mail_project_rules.resolve_mail_project(
+            {
+                "subject": "Project update JE",
+                "sender_email": "person@example.com",
+                "sender_display": "Person",
+            },
+            index=index,
+        )
+
+        assert match is not None
+        assert match.project == "2025-12-journal-extension"
+        assert match.source == "mail_code"
+
+
 class TestConversationSaveFlow:
     def test_explicit_outlook_client_routes_through_outlook_adapter(self) -> None:
         selected = _mail("outlook-id", "Outlook subject")
@@ -531,11 +687,15 @@ class TestConversationSaveFlow:
         adapter_calls: list[str] = []
         created: list[dict] = []
 
+        def fake_archive(*args, **kwargs) -> str:
+            adapter_calls.append("archive")
+            return "OK"
+
         fake_adapter = SimpleNamespace(
             get_selected_mail_headers=lambda: [selected],
             fetch_mail_body=lambda *args, **kwargs: "outlook body",
             save_attachments=lambda *args, **kwargs: [],
-            archive_mail=lambda *args, **kwargs: adapter_calls.append("archive"),
+            archive_mail=fake_archive,
             fetch_all_mailboxes=lambda since_days=7: {
                 "inbox": [],
                 "sent": [],
@@ -567,6 +727,48 @@ class TestConversationSaveFlow:
         assert outcome["results"][0]["slug"] == "slug-outlook"
         assert created[0]["mail_client"] == "outlook"
         assert created[0]["body"] == "outlook body"
+        assert outcome["results"][0]["archived"] == "OK"
+        assert adapter_calls == ["archive"]
+
+    def test_explicit_outlook_client_respects_no_archive(self) -> None:
+        selected = _mail("outlook-id", "Outlook subject")
+        selected.pop("mail_client", None)
+        adapter_calls: list[str] = []
+
+        fake_adapter = SimpleNamespace(
+            get_selected_mail_headers=lambda: [selected],
+            fetch_mail_body=lambda *args, **kwargs: "outlook body",
+            save_attachments=lambda *args, **kwargs: [],
+            archive_mail=lambda *args, **kwargs: adapter_calls.append("archive"),
+            fetch_all_mailboxes=lambda since_days=7: {
+                "inbox": [],
+                "sent": [],
+                "deleted": [],
+            },
+        )
+
+        def fake_load_mail_client(client: str):
+            assert client == "outlook"
+            return fake_adapter
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("save_mail._load_mail_client", side_effect=fake_load_mail_client)
+            )
+            stack.enter_context(patch("save_mail.is_duplicate", return_value=None))
+            stack.enter_context(
+                patch("save_mail.create_mail_note", return_value={"slug": "slug-outlook"})
+            )
+            stack.enter_context(patch("save_mail._write_log"))
+
+            outcome = save_selected_mail(
+                client="outlook",
+                no_archive=True,
+                verbose=False,
+            )
+
+        assert outcome["results"][0]["slug"] == "slug-outlook"
+        assert "archived" not in outcome["results"][0]
         assert adapter_calls == []
 
     def test_auto_client_prefers_outlook_when_outlook_has_selection(self) -> None:
@@ -1394,6 +1596,50 @@ class TestMailSlugCreation:
         assert ts == "20260516-1345"
         assert slug == "20260516-1345-mail-anne-project-update-2"
 
+    def test_display_only_outlook_sender_is_used_for_entity_slug(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        vault = tmp_path / "vault"
+        notes = vault / "10_notes"
+        entities = vault / "system" / "entities"
+        monkeypatch.setattr(save_mail, "VAULT_ROOT", vault)
+        monkeypatch.setattr(save_mail.brain_lib.cfg, "vault_root", vault)
+        monkeypatch.setattr(save_mail.brain_lib.cfg, "vault_notes", notes)
+        monkeypatch.setattr(save_mail.brain_lib.cfg, "vault_entities", entities)
+        monkeypatch.setattr(save_mail.brain_lib, "link_note_in_daily", lambda *a, **k: None)
+
+        result = save_mail.create_mail_note(
+            {
+                "subject": "AskIT: Je aanvraag REQ0116499",
+                "sender_email": "askit servicenow",
+                "sender_display": "AskIT ServiceNow",
+                "date_str": "2026-06-17 11:01:00",
+                "message_id": "outlook-display-only@example.local",
+                "account": "viggo.meesters@bam.com",
+                "mailbox": "Inbox",
+                "to": "",
+                "cc": "",
+                "att_count": "0",
+                "att_names": "",
+                "is_flagged": False,
+                "all_headers": "",
+                "mailbox_type": "inbox",
+                "body": "Ticket geregistreerd.",
+                "mail_client": "outlook",
+            }
+        )
+
+        assert result["entity"] == "askit-servicenow"
+        assert result["slug"] == "20260617-1101-mail-askit-servicenow-askit-je-aanvraag"
+        content = Path(result["path"]).read_text(encoding="utf-8")
+        assert 'entity: ["askit-servicenow"]' in content
+        assert "to: viggo.meesters@bam.com" in content
+        assert "📧 From: [[askit-servicenow]] (askit servicenow)" in content
+        assert "📬 To: viggo.meesters@bam.com" in content
+        entity_content = (entities / "askit-servicenow.md").read_text(encoding="utf-8")
+        assert "source: auto-created-from-outlook-display-name" in entity_content
+        assert "title: AskIT ServiceNow" in entity_content
+
 
 class TestFollowUpTaskCreation:
     def test_uses_task_prefix(self, tmp_path, monkeypatch) -> None:
@@ -1426,9 +1672,84 @@ class TestFollowUpTaskCreation:
         )
 
 
+class TestSavedDataSize:
+    def test_format_data_size_uses_human_units(self) -> None:
+        assert save_mail.format_data_size(512) == "512 B"
+        assert save_mail.format_data_size(1536) == "1.5 KB"
+        assert save_mail.format_data_size(2 * 1024 * 1024) == "2.0 MB"
+
+    def test_create_mail_note_returns_note_size(self, tmp_path, monkeypatch) -> None:
+        vault = tmp_path / "vault"
+        notes = vault / "10_notes"
+        monkeypatch.setattr(save_mail.brain_lib.cfg, "vault_root", vault)
+        monkeypatch.setattr(save_mail.brain_lib.cfg, "vault_notes", notes)
+        monkeypatch.setattr(
+            save_mail.brain_lib,
+            "link_note_in_daily",
+            lambda *a, **k: None,
+        )
+
+        result = save_mail.create_mail_note(
+            {
+                "subject": "Re: Project Update",
+                "sender_email": "person@example.com",
+                "sender_display": "Person Example",
+                "date_str": "2026-05-01 10:00:00",
+                "message_id": "size@example.com",
+                "account": "iCloud",
+                "mailbox": "Inbox",
+                "to": "viggomeesters@icloud.com",
+                "cc": "",
+                "att_count": "0",
+                "att_names": "",
+                "is_flagged": False,
+                "all_headers": "",
+                "mailbox_type": "inbox",
+                "body": "Saved body.",
+            }
+        )
+
+        path = Path(result["path"])
+        assert result["note_bytes"] == path.stat().st_size
+        assert result["note_size"] == save_mail.format_data_size(path.stat().st_size)
+        assert result["capture_source"] == "save-mail"
+        assert result["capture_version"] == 1
+        assert result["enrichment_status"] == "pending"
+        assert result["enrichment_version"] == 0
+        assert result["raw_subject"] == "Re: Project Update"
+        assert result["clean_subject"] == "Project Update"
+        assert result["sender_domain"] == "example.com"
+
+        content = path.read_text(encoding="utf-8")
+        assert "capture_source: save-mail" in content
+        assert "capture_version: 1" in content
+        assert "enrichment_status: pending" in content
+        assert "enrichment_version: 0" in content
+        assert 'raw_subject: "Re: Project Update"' in content
+        assert "clean_subject: Project Update" in content
+        assert "sender_domain: example.com" in content
+
+
 class TestArchiveRouting:
+    def test_display_only_sender_gets_stable_entity_slug(self) -> None:
+        assert (
+            save_mail._entity_slug_from_display_name("askit servicenow")
+            == "askit-servicenow"
+        )
+
+    def test_unknown_display_sender_does_not_create_entity_slug(self) -> None:
+        assert save_mail._entity_slug_from_display_name("unknown sender") is None
+
     def test_inbox_mail_archives_after_save(self) -> None:
         mail = _mail("one@example.com", "Inbox mail")
+
+        assert save_mail._should_archive_after_save(
+            mail, no_archive=False, single_mode=True
+        )
+
+    def test_outlook_inbox_mail_archives_after_save(self) -> None:
+        mail = _mail("outlook-id", "Outlook inbox")
+        mail["mail_client"] = "outlook"
 
         assert save_mail._should_archive_after_save(
             mail, no_archive=False, single_mode=True
@@ -1488,3 +1809,78 @@ class TestArchiveRouting:
         assert result["status"] == "saved"
         assert result["archived"] == "ERROR:AppleScript timed out after 15s"
         assert result["archive_error"] == "ERROR:AppleScript timed out after 15s"
+
+
+class TestOutlookArchive:
+    def test_new_outlook_archive_uses_menu_after_matching_selection(self) -> None:
+        calls: list[str] = []
+
+        def fake_run_applescript(script: str, timeout: int = 10) -> str:
+            calls.append(script)
+            return "OK"
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("mail_outlook_applescript._is_new_outlook_enabled", return_value=True)
+            )
+            stack.enter_context(
+                patch(
+                    "mail_outlook_applescript._get_selected_mail_header_from_accessibility",
+                    return_value={"message_id": "outlook-id"},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "mail_outlook_applescript.run_applescript",
+                    side_effect=fake_run_applescript,
+                )
+            )
+
+            result = mail_outlook_applescript.archive_mail("outlook-id", "account")
+
+        assert result == "OK"
+        assert calls
+        assert "Archive" in calls[0]
+
+    def test_new_outlook_archive_skips_when_selection_changed(self) -> None:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("mail_outlook_applescript._is_new_outlook_enabled", return_value=True)
+            )
+            stack.enter_context(
+                patch(
+                    "mail_outlook_applescript._get_selected_mail_header_from_accessibility",
+                    return_value={"message_id": "other-id"},
+                )
+            )
+            run_applescript = stack.enter_context(
+                patch("mail_outlook_applescript.run_applescript")
+            )
+
+            result = mail_outlook_applescript.archive_mail("outlook-id", "account")
+
+        assert result == "SKIPPED:outlook selection changed"
+        run_applescript.assert_not_called()
+
+    def test_synthetic_outlook_id_requires_selection_check(self) -> None:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("mail_outlook_applescript._is_new_outlook_enabled", return_value=False)
+            )
+            stack.enter_context(
+                patch(
+                    "mail_outlook_applescript._get_selected_mail_header_from_accessibility",
+                    return_value={"message_id": "other-id"},
+                )
+            )
+            run_applescript = stack.enter_context(
+                patch("mail_outlook_applescript.run_applescript")
+            )
+
+            result = mail_outlook_applescript.archive_mail(
+                "outlook-abc123@local.outlook",
+                "account",
+            )
+
+        assert result == "SKIPPED:outlook selection changed"
+        run_applescript.assert_not_called()

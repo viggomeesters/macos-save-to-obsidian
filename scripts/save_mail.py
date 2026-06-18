@@ -25,7 +25,9 @@ from typing import Any, Iterator
 
 import yaml
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "shared"))
+REPO_SHARED = Path(__file__).resolve().parents[1] / "shared"
+if str(REPO_SHARED) not in sys.path:
+    sys.path.insert(0, str(REPO_SHARED))
 import brain_lib
 
 from entity_resolver import SELF_EMAILS, resolve_entity, suggest_topics
@@ -57,6 +59,11 @@ MAIL_CLIENT_APPLE = "apple"
 MAIL_CLIENT_OUTLOOK = "outlook"
 MAIL_CLIENT_AUTO = "auto"
 MAIL_CLIENTS = (MAIL_CLIENT_APPLE, MAIL_CLIENT_OUTLOOK, MAIL_CLIENT_AUTO)
+OUTLOOK_RUNTIME_BLOCKER = "System Events access is blocked"
+MAIL_CAPTURE_VERSION = 1
+MAIL_CAPTURE_SOURCE = "save-mail"
+MAIL_ENRICHMENT_STATUS_PENDING = "pending"
+MAIL_ENRICHMENT_VERSION = 0
 
 
 def _load_mail_client(client: str) -> ModuleType:
@@ -96,6 +103,8 @@ def get_selected_headers_for_client(client: str) -> tuple[str, list[dict[str, An
         try:
             return candidate, adapter.get_selected_mail_headers()
         except Exception as exc:
+            if candidate == MAIL_CLIENT_OUTLOOK and OUTLOOK_RUNTIME_BLOCKER in str(exc):
+                raise RuntimeError(str(exc)) from exc
             errors.append(f"{candidate}: {exc}")
     detail = "; ".join(errors) if errors else "no supported mail clients available"
     raise RuntimeError(f"No selected mail found in Outlook or Apple Mail ({detail})")
@@ -328,6 +337,13 @@ def normalize_subject(subject: str) -> str:
     cleaned = strip_reply_prefixes(subject)
     cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
     return cleaned
+
+
+def clean_mail_subject(subject: str) -> str:
+    """Return a conservative display/search subject while preserving raw_subject."""
+    cleaned = strip_reply_prefixes(subject or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or (subject or "Geen onderwerp").strip() or "Geen onderwerp"
 
 
 def is_generic_subject(subject: str) -> bool:
@@ -837,14 +853,27 @@ def create_mail_note(
     """Create vault interaction note. Returns result dict."""
     dt = parse_apple_date(mail["date_str"])
     sender_email = mail["sender_email"]
-    to_emails = mail["to"]
-    subject = mail.get("subject", "Geen onderwerp")
-    message_id = mail["message_id"]
     mailbox_type = _mailbox_type(mail)
+    to_emails = _effective_to_emails(mail, mailbox_type)
+    subject = mail.get("subject", "Geen onderwerp")
+    clean_subject = clean_mail_subject(subject)
+    message_id = mail["message_id"]
     mail_client = mail.get("mail_client", "apple")
     calendar_invite = is_calendar_invite(mail)
+    sender_domain = _email_domain(sender_email)
 
     entity_slug, direction = resolve_entity(sender_email, to_emails)
+    if entity_slug == "unknown-sender" and "@" not in sender_email:
+        display_slug = _entity_slug_from_display_name(
+            mail.get("sender_display", "") or sender_email
+        )
+        if display_slug:
+            entity_slug = display_slug
+            _ensure_display_entity_note(
+                entity_slug,
+                mail.get("sender_display", "") or sender_email,
+                area=_area_from_source_account(mail.get("account", "")),
+            )
     project_match = detect_mail_project(mail)
     area = (
         project_match.area
@@ -897,12 +926,19 @@ def create_mail_note(
         "slug": slug,
         "timestamp": ts,
         "area": area,
+        "capture_source": MAIL_CAPTURE_SOURCE,
+        "capture_version": MAIL_CAPTURE_VERSION,
+        "clean_subject": escape_title(clean_subject),
         "direction": direction,
+        "enrichment_status": MAIL_ENRICHMENT_STATUS_PENDING,
+        "enrichment_version": MAIL_ENRICHMENT_VERSION,
         "entity": [entity_slug],
         "from": sender_email,
         "mail_link": f"message://<{message_id}>",
         "mail_client": mail_client,
         "mailbox_type": mailbox_type,
+        "raw_subject": escaped_subject,
+        "sender_domain": sender_domain,
         "source_account": mail.get("account", ""),
         "source_mailbox": mail.get("mailbox", ""),
         "title": escaped_subject,
@@ -1002,6 +1038,13 @@ def create_mail_note(
         "thread": thread_slugs,
         "attachments": len(att_links),
         "subject": subject,
+        "raw_subject": subject,
+        "clean_subject": clean_subject,
+        "sender_domain": sender_domain,
+        "capture_source": MAIL_CAPTURE_SOURCE,
+        "capture_version": MAIL_CAPTURE_VERSION,
+        "enrichment_status": MAIL_ENRICHMENT_STATUS_PENDING,
+        "enrichment_version": MAIL_ENRICHMENT_VERSION,
         "path": str(filepath),
         "obsidian_file": brain_lib.obsidian_file_ref(filepath),
     }
@@ -1024,6 +1067,11 @@ def create_mail_note(
         result["task_path"] = task_result["path"]
         _append_task_link(filepath, task_result["slug"])
         brain_lib.link_note_in_daily(task_result["slug"])
+
+    note_bytes = _file_size(filepath)
+    if note_bytes is not None:
+        result["note_bytes"] = note_bytes
+        result["note_size"] = format_data_size(note_bytes)
 
     return result
 
@@ -1165,12 +1213,88 @@ def _mailbox_type(mail: dict[str, Any]) -> str:
     return classify_mailbox_type(mail.get("mailbox", ""), mail.get("account", ""))
 
 
+def _entity_slug_from_display_name(value: str) -> str | None:
+    """Derive a conservative entity slug when Outlook only exposes a display name."""
+    text = re.sub(
+        r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
+        " ",
+        value or "",
+        flags=re.I,
+    )
+    text = re.sub(r"\+\d+\s+others?", " ", text, flags=re.I)
+    parts = re.findall(r"[a-z0-9]+", text.lower())
+    parts = [part for part in parts if part not in {"unknown", "sender"}]
+    if not parts:
+        return None
+    return "-".join(parts[:6])
+
+
+def _looks_like_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", (value or "").strip()))
+
+
+def _email_domain(value: str) -> str:
+    value = (value or "").strip().lower()
+    if "@" not in value:
+        return ""
+    return value.rsplit("@", 1)[-1]
+
+
+def _effective_to_emails(mail: dict[str, Any], mailbox_type: str) -> str:
+    to_emails = str(mail.get("to", "") or "").strip()
+    if to_emails:
+        return to_emails
+    account = str(mail.get("account", "") or "").strip().lower()
+    if mailbox_type == "inbox" and _looks_like_email(account):
+        return account
+    return ""
+
+
+def _area_from_source_account(account: str) -> str:
+    account_lower = (account or "").strip().lower()
+    if account_lower.endswith("@bam.com") or "mccoy" in account_lower:
+        return "work"
+    return "self"
+
+
+def _display_entity_title(value: str, slug: str) -> str:
+    raw = re.sub(r"\s+", " ", value or "").strip()
+    if not raw:
+        raw = slug.replace("-", " ")
+    words = []
+    known = {"askit": "AskIT", "servicenow": "ServiceNow", "bam": "BAM"}
+    for word in raw.split():
+        words.append(known.get(word.lower(), word[:1].upper() + word[1:]))
+    return " ".join(words)
+
+
+def _ensure_display_entity_note(entity_slug: str, display_name: str, *, area: str) -> None:
+    """Create a minimal entity for display-only Outlook senders."""
+    entity_dir = brain_lib.cfg.vault_entities
+    entity_path = entity_dir / f"{entity_slug}.md"
+    if entity_path.exists():
+        return
+
+    now = datetime.now()
+    title = _display_entity_title(display_name, entity_slug)
+    fm = {
+        "type": "entity",
+        "category": "company",
+        "created": now.strftime("%Y-%m-%d"),
+        "slug": entity_slug,
+        "timestamp": now.strftime("%Y%m%d-%H%M"),
+        "area": area,
+        "source": "auto-created-from-outlook-display-name",
+        "title": escape_title(title),
+    }
+    body = f"# {title}\n"
+    vnw.write_vault_note(entity_path, fm, body)
+
+
 def _should_archive_after_save(
     mail: dict[str, Any], *, no_archive: bool, single_mode: bool
 ) -> bool:
     if no_archive:
-        return False
-    if mail.get("mail_client") == MAIL_CLIENT_OUTLOOK:
         return False
     if not clean_message_id(mail.get("message_id", "")):
         return False
@@ -1246,7 +1370,10 @@ def process_mail_record(
     )
     _timed("note")
     if verbose:
-        _step(f"{prefix}📝 → [[{result['slug']}]]")
+        size_suffix = (
+            f" ({result['note_size']})" if result.get("note_size") else ""
+        )
+        _step(f"{prefix}📝 → [[{result['slug']}]]{size_suffix}")
         if result.get("task_slug"):
             _step(f"{prefix}📋 Task → [[{result['task_slug']}]]")
 
@@ -1724,7 +1851,10 @@ def batch_process(as_json: bool = False, since_days: int = 7) -> list[dict]:
                 )
 
             if not as_json:
-                _step(f"      📝 → [[{result['slug']}]]")
+                size_suffix = (
+                    f" ({result['note_size']})" if result.get("note_size") else ""
+                )
+                _step(f"      📝 → [[{result['slug']}]]{size_suffix}")
 
             if result.get("task_slug") and not as_json:
                 _step(f"      📋 Task → [[{result['task_slug']}]]")
@@ -1754,7 +1884,10 @@ def batch_process(as_json: bool = False, since_days: int = 7) -> list[dict]:
 
             elapsed = time.time() - t0
             if not as_json:
-                _step(f"      ✅ ({elapsed:.1f}s)")
+                size_prefix = (
+                    f"{result['note_size']}, " if result.get("note_size") else ""
+                )
+                _step(f"      ✅ ({size_prefix}{elapsed:.1f}s)")
 
             # 5. Log
             result["status"] = "saved"
@@ -1777,6 +1910,31 @@ _timings: dict[str, float] = {}
 def _step(msg: str) -> None:
     """Print a progress step (flushed for real-time Raycast output)."""
     print(msg, flush=True)
+
+
+def _file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def format_data_size(num_bytes: int) -> str:
+    """Format a byte count for Raycast output."""
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+
+def _total_note_size(results: list[dict[str, Any]]) -> str:
+    total = sum(
+        int(result["note_bytes"])
+        for result in results
+        if isinstance(result.get("note_bytes"), int)
+    )
+    return format_data_size(total) if total else ""
 
 
 def _timed(label: str) -> float:
@@ -1856,21 +2014,35 @@ def main() -> None:
             dupes = [r for r in results if r.get("status") == "duplicate"]
             _step("━" * 40)
             if outcome["mode"] == "conversation":
+                size = _total_note_size(saved)
+                size_suffix = f", {size}" if size else ""
                 _step(
                     f"✅ Conversation klaar: {len(saved)} opgeslagen, "
-                    f"{len(dupes)} al verwerkt ({total_ms / 1000:.1f}s)"
+                    f"{len(dupes)} al verwerkt{size_suffix} "
+                    f"({total_ms / 1000:.1f}s)"
                 )
             elif outcome["mode"] == "selection":
+                size = _total_note_size(saved)
+                size_suffix = f", {size}" if size else ""
                 _step(
                     f"✅ Selectie klaar: {len(saved)} opgeslagen, "
-                    f"{len(dupes)} al verwerkt ({total_ms / 1000:.1f}s)"
+                    f"{len(dupes)} al verwerkt{size_suffix} "
+                    f"({total_ms / 1000:.1f}s)"
                 )
             else:
                 result = results[0]
                 if result.get("status") == "duplicate":
                     _step(f"✅ Al verwerkt: [[{result['slug']}]]")
                 else:
-                    _step(f"✅ [[{result['slug']}]]  ({total_ms / 1000:.1f}s)")
+                    size_prefix = (
+                        f"{result['note_size']}, "
+                        if result.get("note_size")
+                        else ""
+                    )
+                    _step(
+                        f"✅ [[{result['slug']}]]  "
+                        f"({size_prefix}{total_ms / 1000:.1f}s)"
+                    )
 
     except RuntimeError as e:
         error_msg = str(e)
@@ -1880,6 +2052,12 @@ def main() -> None:
             print(json.dumps({"status": "error", "message": error_msg}))
         else:
             _step(f"\n❌ {error_msg}")
+            if (
+                "No selected mail found in Outlook or Apple Mail" in error_msg
+                or "No selected Outlook mail." in error_msg
+                or "Copied clipboard content is not an Outlook message." in error_msg
+            ):
+                return
         sys.exit(1)
     except Exception as e:
         _timed("error")
