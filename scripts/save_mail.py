@@ -207,42 +207,80 @@ def detect_mail_project(mail: dict[str, Any]) -> MailProjectMatch | None:
 _DEDUP_CACHE = brain_lib.ROOT / "context" / "observability" / "save-mail-dedup.json"
 
 
-def _dedup_cache_check(message_id: str) -> str | None:
-    """Check local dedup cache (survives when SQLite indexer is down)."""
+def _dedup_cache_read() -> dict[str, str]:
     try:
         if _DEDUP_CACHE.exists():
             cache = json.loads(_DEDUP_CACHE.read_text())
-            return cache.get(message_id)
+            if isinstance(cache, dict):
+                return {str(k): str(v) for k, v in cache.items()}
     except Exception:
         pass
+    return {}
+
+
+def _dedup_cache_write(cache: dict[str, str]) -> None:
+    _DEDUP_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    _DEDUP_CACHE.write_text(json.dumps(cache, sort_keys=True), encoding="utf-8")
+
+
+def _dedup_cache_check(message_id: str, fingerprint: str = "") -> str | None:
+    """Check local dedup cache (survives when SQLite indexer is down)."""
+    cache = _dedup_cache_read()
+    if fingerprint:
+        cached = cache.get(f"fingerprint:{fingerprint}")
+        if cached:
+            return cached
+    if message_id:
+        return cache.get(message_id) or cache.get(f"message-id:{message_id.lower()}")
     return None
 
 
-def _dedup_cache_add(message_id: str, slug: str) -> None:
+def _normalized_mail_addresses(value: str) -> str:
+    emails = sorted({email.lower() for email in EMAIL_RE.findall(value or "")})
+    if emails:
+        return ",".join(emails)
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def mail_dedup_fingerprint(mail: dict[str, Any]) -> str:
+    """Build a stable identity for a mail when Message-ID lookup is unavailable."""
+    mailbox_type = _mailbox_type(mail)
+    dt = parse_apple_date(str(mail.get("date_str", "")))
+    subject = normalize_subject(mail.get("subject", ""))
+    to_emails = _effective_to_emails(mail, mailbox_type)
+    parts = [
+        "mail-dedup-v1",
+        dt.strftime("%Y-%m-%d %H:%M:%S"),
+        subject,
+        str(mail.get("sender_email", "")).strip().lower(),
+        _normalized_mail_addresses(to_emails),
+        _normalized_mail_addresses(str(mail.get("cc", ""))),
+    ]
+    raw = "\n".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _dedup_cache_add(
+    message_id: str, slug: str, mail: dict[str, Any] | None = None
+) -> None:
     """Add entry to local dedup cache."""
     message_id = clean_message_id(message_id)
-    if not message_id:
+    fingerprint = mail_dedup_fingerprint(mail) if mail else ""
+    if not message_id and not fingerprint:
         return
     try:
-        cache = {}
-        if _DEDUP_CACHE.exists():
-            cache = json.loads(_DEDUP_CACHE.read_text())
-        cache[message_id] = slug
-        _DEDUP_CACHE.write_text(json.dumps(cache))
+        cache = _dedup_cache_read()
+        if message_id:
+            cache[message_id] = slug
+            cache[f"message-id:{message_id.lower()}"] = slug
+        if fingerprint:
+            cache[f"fingerprint:{fingerprint}"] = slug
+        _dedup_cache_write(cache)
     except Exception:
         pass
 
 
-def is_duplicate(message_id: str) -> str | None:
-    """Check if a mail with this message_id already exists. Returns slug or None."""
-    message_id = clean_message_id(message_id)
-    if not message_id:
-        return None
-
-    cached = _dedup_cache_check(message_id)
-    if cached:
-        return cached
-
+def _sqlite_duplicate_by_message_id(message_id: str) -> str | None:
     try:
         import sqlite3
 
@@ -272,6 +310,113 @@ def is_duplicate(message_id: str) -> str | None:
         return rows[0][0] if rows else None
     except Exception:
         return None
+
+
+def _sqlite_duplicate_by_fingerprint(fingerprint: str) -> str | None:
+    if not fingerprint:
+        return None
+    try:
+        import sqlite3
+
+        db_path = VAULT_ROOT / ".brain-vault-index.sqlite"
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            escaped = (
+                fingerprint.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            rows = conn.execute(
+                "SELECT path FROM notes WHERE type = 'interaction' AND category = 'mail' "
+                "AND frontmatter_json LIKE ? ESCAPE '\\' LIMIT 1",
+                (f"%{escaped}%",),
+            ).fetchall()
+            if rows:
+                from pathlib import PurePosixPath
+
+                rows = [(PurePosixPath(rows[0][0]).stem,)]
+        finally:
+            conn.close()
+        return rows[0][0] if rows else None
+    except Exception:
+        return None
+
+
+def _frontmatter_matches_mail(frontmatter: dict[str, Any], mail: dict[str, Any]) -> bool:
+    mailbox_type = _mailbox_type(mail)
+    dt = parse_apple_date(str(mail.get("date_str", "")))
+    expected_ts = dt.strftime("%Y%m%d-%H%M")
+    note_ts = str(frontmatter.get("timestamp", ""))
+    if note_ts != expected_ts:
+        return False
+    note_subject = str(
+        frontmatter.get("clean_subject") or frontmatter.get("raw_subject") or ""
+    )
+    if normalize_subject(note_subject) != normalize_subject(mail.get("subject", "")):
+        return False
+    if str(frontmatter.get("from", "")).strip().lower() != str(
+        mail.get("sender_email", "")
+    ).strip().lower():
+        return False
+    note_to = _normalized_mail_addresses(str(frontmatter.get("to", "")))
+    mail_to = _normalized_mail_addresses(_effective_to_emails(mail, mailbox_type))
+    if note_to or mail_to:
+        return note_to == mail_to
+    return True
+
+
+def _filesystem_duplicate_by_mail(mail: dict[str, Any], fingerprint: str) -> str | None:
+    dt = parse_apple_date(str(mail.get("date_str", "")))
+    ts = dt.strftime("%Y%m%d-%H%M")
+    month_dir = NOTES_DIR / dt.strftime("%Y-%m")
+    candidate_dirs = [month_dir, INBOX_DIR]
+    candidates: list[Path] = []
+    for directory in candidate_dirs:
+        if directory.exists():
+            candidates.extend(directory.glob(f"{ts}-mail-*.md"))
+
+    def candidate_sort_key(path: Path) -> tuple[str, int, str]:
+        base = re.sub(r"-\d+$", "", path.stem)
+        has_counter = 1 if base != path.stem else 0
+        return (base, has_counter, path.stem)
+
+    for path in sorted(candidates, key=candidate_sort_key):
+        try:
+            frontmatter, _ = _split_note_content(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not frontmatter:
+            continue
+        slug = str(frontmatter.get("slug") or path.stem)
+        if fingerprint and frontmatter.get("dedup_fingerprint") == fingerprint:
+            return slug
+        if _frontmatter_matches_mail(frontmatter, mail):
+            return slug
+    return None
+
+
+def is_duplicate(message_id: str, mail: dict[str, Any] | None = None) -> str | None:
+    """Check if a mail already exists. Returns slug or None."""
+    message_id = clean_message_id(message_id)
+    fingerprint = mail_dedup_fingerprint(mail) if mail else ""
+    if not message_id and not fingerprint:
+        return None
+
+    cached = _dedup_cache_check(message_id, fingerprint)
+    if cached:
+        return cached
+
+    existing = _sqlite_duplicate_by_message_id(message_id) if message_id else None
+    if not existing and fingerprint:
+        existing = _sqlite_duplicate_by_fingerprint(fingerprint)
+    if not existing and mail:
+        existing = _filesystem_duplicate_by_mail(mail, fingerprint)
+    if existing:
+        _dedup_cache_add(message_id, existing, mail=mail)
+    return existing
 
 
 def find_thread_notes(entity_slug: str, subject: str) -> list[str]:
@@ -1012,6 +1157,7 @@ def create_mail_note(
         calendar_invite=calendar_invite,
     )
     thread_metadata = mail_thread_metadata(mail)
+    dedup_fingerprint = mail_dedup_fingerprint(mail)
     fm: dict[str, Any] = {
         "type": "interaction",
         "category": "mail",
@@ -1023,6 +1169,7 @@ def create_mail_note(
         "capture_version": MAIL_CAPTURE_VERSION,
         "clean_subject": escaped_clean_subject,
         "direction": direction,
+        "dedup_fingerprint": dedup_fingerprint,
         "enrichment_status": MAIL_ENRICHMENT_STATUS_PENDING,
         "enrichment_version": MAIL_ENRICHMENT_VERSION,
         "entity": [entity_slug],
@@ -1138,7 +1285,7 @@ def create_mail_note(
     now_ts = datetime.now().strftime("%Y%m%d-%H%M")
     brain_lib.link_note_in_daily(slug, timestamp=now_ts)
 
-    _dedup_cache_add(message_id, slug)
+    _dedup_cache_add(message_id, slug, mail=mail)
 
     result = {
         "slug": slug,
@@ -1461,7 +1608,7 @@ def process_mail_record(
     subject = mail.get("subject", "?")
     message_id = mail["message_id"]
 
-    existing = is_duplicate(message_id)
+    existing = is_duplicate(message_id, mail=mail)
     _timed("dedup")
     if existing:
         now_ts = datetime.now().strftime("%Y%m%d-%H%M")
@@ -1892,15 +2039,9 @@ def batch_process(as_json: bool = False, since_days: int = 7) -> list[dict]:
         # Pre-filter sent/deleted duplicates (they can't be archived, so skip silently)
         skipped_dupes = 0
         if mailbox_type in ("sent", "deleted") and mails:
-            dedup_cache = {}
-            try:
-                if _DEDUP_CACHE.exists():
-                    dedup_cache = json.loads(_DEDUP_CACHE.read_text())
-            except Exception:
-                pass
             new_mails = []
             for m in mails:
-                cached_slug = dedup_cache.get(m.get("message_id", ""))
+                cached_slug = is_duplicate(m.get("message_id", ""), mail=m)
                 if cached_slug:
                     skipped_dupes += 1
                     all_results.append(
@@ -1939,7 +2080,7 @@ def batch_process(as_json: bool = False, since_days: int = 7) -> list[dict]:
                 )
 
             # 1. Dedup
-            existing = is_duplicate(mail["message_id"])
+            existing = is_duplicate(mail["message_id"], mail=mail)
             if existing:
                 if not as_json:
                     _step(f"      ♻️  al verwerkt → [[{existing}]]")
@@ -2097,6 +2238,7 @@ def _timed(label: str) -> float:
 def _write_log(entry: dict) -> None:
     """Append a JSON log entry to the save-mail log."""
     try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         log = {**entry, "timings": dict(_timings), "ts": datetime.now().isoformat()}
         with open(_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(log, default=str) + "\n")

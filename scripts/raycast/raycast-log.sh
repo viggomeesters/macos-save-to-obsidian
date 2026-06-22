@@ -13,15 +13,37 @@ export BRAIN_SHARED="$MACOS_MAIL_REPO/shared"
 export LIFE_OS_SHARED="$BRAIN_SHARED"
 export RAYCAST_COMMAND_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[1]:-$0}")" && pwd)/$(basename "${BASH_SOURCE[1]:-$0}")"
 export RAYCAST_COMMAND_LOG="${BRAIN_STATE_DIR:-$BRAIN_DIR/state}/raycast/commands.jsonl"
+export RAYCAST_PYTHON="${RAYCAST_PYTHON:-/usr/bin/python3}"
 
-if [[ ! -f "$BRAIN_DIR/CLAUDE.md" ]]; then
+if [[ ! -d "$BRAIN_DIR" || ! -d "$BRAIN_SCRIPTS" || ! -d "$BRAIN_SHARED" ]]; then
     echo "ERROR: BRAIN_DIR resolution failed: $BRAIN_DIR" >&2
     exit 1
 fi
 
+_PYTHON_VERSION="$("$RAYCAST_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+_PYTHON_USER_SITE="$("$RAYCAST_PYTHON" -c 'import site; print(site.getusersitepackages())' 2>/dev/null || true)"
+_REPO_USER_HOME="${MACOS_MAIL_REPO%%/Dev/*}"
+for _PY_SITE in \
+    "$_PYTHON_USER_SITE" \
+    "$_REPO_USER_HOME/Library/Python/$_PYTHON_VERSION/lib/python/site-packages"; do
+    if [[ -n "$_PY_SITE" && -d "$_PY_SITE" ]]; then
+        case ":${PYTHONPATH:-}:" in
+            *":$_PY_SITE:"*) ;;
+            *) export PYTHONPATH="$_PY_SITE${PYTHONPATH:+:$PYTHONPATH}" ;;
+        esac
+    fi
+done
+unset _PY_SITE _PYTHON_VERSION _PYTHON_USER_SITE _REPO_USER_HOME
+
 # Ensure brain-env.sh is loaded (provides _log_brain_event)
 if ! type _log_brain_event &>/dev/null; then
-    source "$BRAIN_SCRIPTS/brain-env.sh"
+    if [[ -f "$BRAIN_SCRIPTS/brain-env.sh" ]]; then
+        source "$BRAIN_SCRIPTS/brain-env.sh"
+    fi
+fi
+
+if ! type _log_brain_event &>/dev/null; then
+    _log_brain_event() { :; }
 fi
 
 _raycast_json_escape() {
@@ -51,7 +73,7 @@ _raycast_abs_path() {
     if [[ -z "$path" ]]; then
         return
     fi
-    python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$path" 2>/dev/null || printf '%s' "$path"
+    "$RAYCAST_PYTHON" -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$path" 2>/dev/null || printf '%s' "$path"
 }
 
 _raycast_resolve_target() {
@@ -76,11 +98,11 @@ _raycast_resolve_target() {
 }
 
 _raycast_now_epoch() {
-    python3 -c 'import time; print(f"{time.time():.6f}")'
+    "$RAYCAST_PYTHON" -c 'import time; print(f"{time.time():.6f}")'
 }
 
 _raycast_now_utc() {
-    python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'
+    "$RAYCAST_PYTHON" -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'
 }
 
 _raycast_now_local() {
@@ -88,7 +110,7 @@ _raycast_now_local() {
 }
 
 _raycast_duration() {
-    python3 - "$1" "$2" <<'PY'
+    "$RAYCAST_PYTHON" - "$1" "$2" <<'PY'
 import sys
 
 start = float(sys.argv[1])

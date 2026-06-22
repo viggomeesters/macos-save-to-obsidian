@@ -173,6 +173,8 @@ def _add_code(
     normalized = normalize_token(code)
     if len(normalized) < 2:
         return
+    if source == "project_code" and len(normalized) < 3:
+        return
     codes.setdefault(normalized, []).append(_code_entry(project, normalized, source))
 
 
@@ -329,11 +331,21 @@ def _match_project_codes(mail: dict[str, Any], index: dict[str, Any]) -> Optiona
 
     matches: list[dict[str, Any]] = []
     for code, entry in (index.get("codes") or {}).items():
+        if entry.get("source") == "project_code" and len(normalize_token(code)) < 3:
+            continue
         if _code_pattern(code).search(text):
             matches.append(entry)
     for code, entries in (index.get("conflicts") or {}).items():
-        if _code_pattern(code).search(text):
-            matches.extend(entries)
+        eligible_entries = [
+            entry
+            for entry in entries
+            if not (
+                entry.get("source") == "project_code"
+                and len(normalize_token(code)) < 3
+            )
+        ]
+        if eligible_entries and _code_pattern(code).search(text):
+            matches.extend(eligible_entries)
 
     if not matches:
         return None

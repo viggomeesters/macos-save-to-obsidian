@@ -373,6 +373,62 @@ class TestDeduplication:
 
         assert save_mail.is_duplicate("abc_example@example.com") == "exact"
 
+    def test_dedup_cache_add_creates_parent_and_matches_fingerprint(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cache = tmp_path / "missing" / "observability" / "dedup.json"
+        mail = _mail("new-id@example.com", "Security alert")
+        monkeypatch.setattr(save_mail, "_DEDUP_CACHE", cache)
+
+        save_mail._dedup_cache_add("old-id@example.com", "existing-slug", mail=mail)
+
+        assert cache.exists()
+        assert (
+            save_mail.is_duplicate("different-id@example.com", mail=mail)
+            == "existing-slug"
+        )
+
+    def test_filesystem_lookup_finds_legacy_duplicate_without_cache_or_index(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        notes_dir = tmp_path / "10_notes"
+        month_dir = notes_dir / "2026-05"
+        inbox_dir = tmp_path / "00_inbox"
+        month_dir.mkdir(parents=True)
+        inbox_dir.mkdir()
+        slug = "20260501-1000-mail-person-project-update"
+        (month_dir / f"{slug}.md").write_text(
+            "\n".join(
+                [
+                    "---",
+                    "type: interaction",
+                    "category: mail",
+                    "created: 2026-05-01",
+                    f"slug: {slug}",
+                    "timestamp: 20260501-1000",
+                    "from: person@example.com",
+                    "to: viggomeesters@icloud.com",
+                    "clean_subject: Project Update",
+                    "---",
+                    "",
+                    "# Project Update",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(save_mail, "NOTES_DIR", notes_dir)
+        monkeypatch.setattr(save_mail, "INBOX_DIR", inbox_dir)
+        monkeypatch.setattr(save_mail, "VAULT_ROOT", tmp_path)
+        monkeypatch.setattr(save_mail, "_DEDUP_CACHE", tmp_path / "missing.json")
+
+        mail = _mail(
+            "different-id@example.com",
+            "Project Update",
+            date="2026-05-01 10:00:00",
+        )
+
+        assert save_mail.is_duplicate("different-id@example.com", mail=mail) == slug
+
 
 class TestMailAppleScriptParsing:
     def test_parse_mail_record_recovers_message_id_from_headers(self) -> None:
